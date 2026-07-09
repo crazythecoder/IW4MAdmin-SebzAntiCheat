@@ -1517,7 +1517,18 @@ acs_escape(value)
         return "";
 
     // Keep log parsing simple. Avoid semicolons in player names/reasons.
-    return "" + value;
+    text = "" + value;
+    parts = strtok(text, ";");
+
+    if (parts.size <= 1)
+        return text;
+
+    cleaned = parts[0];
+
+    for (i = 1; i < parts.size; i++)
+        cleaned += "," + parts[i];
+
+    return cleaned;
 }
 
 acs_boolInt(value)

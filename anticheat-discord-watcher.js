@@ -583,16 +583,26 @@ function shouldSendDiscordAlert(event, evidence) {
   const score = Number(event.score || 0);
   const strong = strongSignalCount(event, evidence);
   const signals = signalSummary(event, evidence);
+  const fpRisk = falsePositiveRisk(event, evidence);
+  const evidenceCount = evidence.length || 1;
 
-  if (score >= 150) {
+  if (score >= 180) {
     return true;
   }
 
-  if (strong >= 1 && score >= 75) {
+  if (strong >= 2 && score >= 100) {
     return true;
   }
 
-  if (signals.recoil && score >= 75) {
+  if (strong >= 1 && score >= 120 && fpRisk !== 'High') {
+    return true;
+  }
+
+  if (signals.recoil && score >= 90) {
+    return true;
+  }
+
+  if (score >= 150 && evidenceCount >= 4 && fpRisk !== 'High') {
     return true;
   }
 

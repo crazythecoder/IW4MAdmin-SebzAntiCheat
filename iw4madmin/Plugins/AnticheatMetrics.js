@@ -2991,7 +2991,7 @@ const plugin = {
         } else if (hard > 0 && risk >= 75 && confidence >= 75) {
             crossed = true;
             reason = 'Hard detection crossed review threshold.';
-        } else if (softEspEvents > 0 && risk >= 85 && confidence >= 55 && (uniqueVictims >= 2 || categories >= 2 || strongAimSupport >= 2 || uniqueReporters >= 1)) {
+        } else if (softEspEvents > 0 && risk >= 85 && confidence >= 55 && (uniqueVictims >= 2 || categories >= 2 || strongAimSupport >= 2 || (uniqueReporters >= 1 && (events >= 3 || strongAimSupport >= 1)))) {
             crossed = true;
             reason = uniqueReporters >= 1
                 ? 'Player report overlaps with suspicious ESP/LOS telemetry.'
@@ -3082,13 +3082,16 @@ const plugin = {
         if (risk >= 85 && confidence >= 85 && group.hardDetectionCount > 0) {
             return 'high_confidence_hard_detection';
         }
-        if (risk >= 80 && uniqueReporters >= 2 && events >= 3) {
+        if (risk >= 80 && confidence >= 55 && uniqueReporters >= 2 && events >= 3) {
             return 'eligible_for_temp_review_hold';
         }
-        if (risk >= 70 && uniqueReporters >= 1 && events >= 2) {
+        if (risk >= 70 && confidence >= 50 && uniqueReporters >= 1 && events >= 2) {
             return 'send_discord_review';
         }
-        if (risk >= 65 && confidence >= 45) {
+        if (String(group.falsePositiveRisk || '').toLowerCase().indexOf('high') !== -1 && confidence < 55) {
+            return 'keep_watching';
+        }
+        if (risk >= 65 && confidence >= 55) {
             return 'needs_staff_review';
         }
         if (risk >= 35 || events > 1) {
