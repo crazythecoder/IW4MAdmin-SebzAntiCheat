@@ -1,0 +1,15 @@
+{
+  "webhookUrl": "DISCORD_WEBHOOK_URL_HERE",
+  "mention": "@here",
+  "cooldownMs": 90000,
+  "acLogFile": "/path/to/iw4madmin/Logs/anti-cheat-combined.log",
+  "databaseFile": "/path/to/iw4madmin/Database/Database.db",
+  "clientMapFile": "/path/to/iw4madmin/Logs/iw4m-client-map.json",
+  "clientMapRefreshMs": 60000,
+  "logs": [
+    {
+      "name": "IW4x Server",
+      "file": "/path/to/iw4x/server/userraw/logs/games_mp.log"
+    }
+  ]
+}

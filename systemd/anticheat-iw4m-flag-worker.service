@@ -1,0 +1,14 @@
+[Unit]
+Description=Anticheat IW4MAdmin flag request worker
+After=docker.service
+
+[Service]
+Type=simple
+User=debian
+WorkingDirectory=/home/debian
+ExecStart=/usr/bin/python3 /home/debian/anticheat_iw4m_flag_worker.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
