@@ -525,7 +525,11 @@ function strongSignalCount(event, evidence) {
     /ADS was locked almost perfectly/i,
     /repeated ADS kills on bots with near-perfect aim/i,
     /repeated ADS snap-lock kills on bots/i,
+    /ADS snap-lock pattern on a bot/i,
     /killed bots repeatedly with very precise aim/i,
+    /repeated sniper snap-kill pattern/i,
+    /repeated quickscope sniper kills/i,
+    /sniper head\/neck hit rate is unusually high/i,
     /killed the target less than 120ms/i
   ].forEach(pattern => {
     if (pattern.test(text)) {
@@ -549,7 +553,10 @@ function weakSignalCount(event, evidence) {
     /killed a bot while ADS was locked/i,
     /ADS was almost perfectly lined up on a bot/i,
     /ADS snapped onto a bot with near-perfect aim/i,
-    /very high short-window accuracy/i
+    /ADS snap-lock pattern on a bot/i,
+    /very high short-window accuracy/i,
+    /many quickscope sniper kills/i,
+    /clear long visibility could explain some sniper kills/i
   ].forEach(pattern => {
     if (pattern.test(text)) {
       count++;
@@ -694,8 +701,11 @@ function suspectedCheatType(event, evidence) {
     return 'Suspicious Aim / Poor Visibility';
   }
 
-  if (/ADS aim stayed tightly locked|ADS was locked almost perfectly|killed a bot while ADS was locked|ADS was almost perfectly lined up on a bot|ADS snapped onto a bot with near-perfect aim|repeated ADS kills on bots with near-perfect aim|repeated ADS snap-lock kills on bots/i.test(text)) {
+  if (/ADS aim stayed tightly locked|ADS was locked almost perfectly|killed a bot while ADS was locked|ADS was almost perfectly lined up on a bot|ADS snapped onto a bot with near-perfect aim|ADS snap-lock pattern on a bot|repeated ADS kills on bots with near-perfect aim|repeated ADS snap-lock kills on bots/i.test(text)) {
     return 'Aim Lock / Aim Assist';
+  }
+  if (/sniper snap-kill pattern|quickscope sniper kills|sniper head\/neck hit rate/i.test(text)) {
+    return 'Sniper Aim Abnormality';
   }
 
   if (/aim was far away|off-target|angle mismatch/i.test(text)) {

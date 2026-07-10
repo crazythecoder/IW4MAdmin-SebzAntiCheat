@@ -632,7 +632,7 @@ const plugin = {
                                 ${this.evidenceItem('Evidence Type', evidenceType)}
                                 ${this.evidenceItem('Map', item.map || 'Unknown')}
                                 ${this.evidenceItem('Weapon', item.weapon || 'Not recorded')}
-                                ${this.evidenceItem('Victim', item.victim || 'Not available')}
+                                ${this.evidenceHtmlItem('Victim', this.victimLink(item.victimName || item.victim || 'Not available'))}
                                 ${this.evidenceItem('Hit', item.hitLocation || 'Not recorded')}
                                 ${this.evidenceItem('Distance', item.distance || 'Unknown')}
                                 ${this.evidenceItem('Angle', item.angle || 'Unknown')}
@@ -806,7 +806,7 @@ const plugin = {
                 <div class="ac-evidence-grid">
                     ${this.evidenceItem('Suspected Cheat', event.suspectedCheat || event.cheatType || 'Unknown')}
                     ${this.evidenceItem('Weapon', event.weapon || 'Not recorded')}
-                    ${this.evidenceItem('Victim', event.victimName || event.victim || 'Not available')}
+                    ${this.evidenceHtmlItem('Victim', this.victimLink(event.victimName || event.victim || 'Not available'))}
                     ${this.evidenceItem('Distance', event.distance || 'Unknown')}
                     ${this.evidenceItem('Angle', event.angle || 'Unknown')}
                     ${this.evidenceItem('Line of Sight', event.lineOfSight || 'Unknown')}
@@ -927,6 +927,14 @@ const plugin = {
             <div class="ac-evidence-item">
                 <span>${this.escape(label)}</span>
                 <strong>${this.escape(value)}</strong>
+            </div>`;
+    },
+
+    evidenceHtmlItem: function (label, htmlValue) {
+        return `
+            <div class="ac-evidence-item">
+                <span>${this.escape(label)}</span>
+                <strong>${htmlValue || this.escape('Not available')}</strong>
             </div>`;
     },
 
@@ -1787,6 +1795,85 @@ const plugin = {
         }
     },
 
+    iw4mFlagEligibility: function (target) {
+        const risk = this.riskInfo(target).score;
+        const confidence = this.confidenceInfo(target).score;
+        const hard = Number(target.hardDetectionCount || 0) > 0 || this.isHardDetection(target.latest || target);
+        const reports = Number(target.reportsCount || target.reports || 0);
+        const uniqueReporters = Number(target.uniqueReporters || 0);
+        const events = Number(target.eventsCount || (target.events || []).length || 0);
+        const categories = Number(target.suspiciousCategories || this.suspiciousCategoryCount(target.events || [], reports, target.hardDetectionCount || 0));
+        const uniqueVictims = Number(target.uniqueVictims || 0);
+        const falsePositiveRisk = String(target.falsePositiveRisk || '').toLowerCase();
+        const highFalsePositiveRisk = falsePositiveRisk.indexOf('high') !== -1;
+        const text = this.eventText(target);
+        const aimLockEvidenceCount = (target.events || [target]).filter(event => {
+            const eventText = this.eventText(event);
+            return this.isAimLockLikeEvent(event) &&
+                (eventText.indexOf('snap-lock') !== -1 ||
+                    eventText.indexOf('ads snapped') !== -1 ||
+                    eventText.indexOf('ads aim stayed tightly') !== -1 ||
+                    eventText.indexOf('near-perfect aim') !== -1 ||
+                    eventText.indexOf('aim lock') !== -1 ||
+                    eventText.indexOf('aim assist') !== -1);
+        }).length;
+        const repeatedAimLock = aimLockEvidenceCount >= 2 &&
+            risk >= 75 &&
+            confidence >= 65 &&
+            !highFalsePositiveRisk;
+        const strongSingleAimLock = (text.indexOf('near-perfect aim') !== -1 ||
+            text.indexOf('ads aim stayed tightly locked') !== -1 ||
+            text.indexOf('ads snapped onto a bot') !== -1) &&
+            risk >= 80 &&
+            confidence >= 70 &&
+            !highFalsePositiveRisk;
+        const repeatedSupportedSoftEvidence = events >= 4 &&
+            risk >= 75 &&
+            confidence >= 60 &&
+            !highFalsePositiveRisk &&
+            (uniqueVictims >= 2 || categories >= 2 || reports > 0);
+
+        if (target.actionsTakenCount > 0 || target.actions > 0 || target.kind === 'AUTO_BAN' || target.kind === 'AUTO_TEMPBAN') {
+            return {
+                eligible: true,
+                reason: 'IW4MAdmin flag allowed because an anti-cheat moderation action already exists.'
+            };
+        }
+
+        if (hard && risk >= 75 && confidence >= 75 && !highFalsePositiveRisk) {
+            return {
+                eligible: true,
+                reason: 'IW4MAdmin flag allowed because hard anti-cheat telemetry crossed risk and confidence thresholds.'
+            };
+        }
+
+        if (strongSingleAimLock || repeatedAimLock) {
+            return {
+                eligible: true,
+                reason: 'IW4MAdmin flag allowed because repeated or very strong aim-lock evidence crossed confidence thresholds.'
+            };
+        }
+
+        if (uniqueReporters >= 2 && events >= 2 && risk >= 70 && confidence >= 55 && !highFalsePositiveRisk) {
+            return {
+                eligible: true,
+                reason: 'IW4MAdmin flag allowed because multiple unique reports overlap with suspicious telemetry.'
+            };
+        }
+
+        if (repeatedSupportedSoftEvidence) {
+            return {
+                eligible: true,
+                reason: 'IW4MAdmin flag allowed because repeated suspicious telemetry has independent support.'
+            };
+        }
+
+        return {
+            eligible: false,
+            reason: 'Marked Watching locally. IW4MAdmin flag skipped because this case is not high-confidence enough yet.'
+        };
+    },
+
     markCaseWatching: function (caseId, originId, originClient) {
         const target = this.findCase(caseId);
 
@@ -1807,6 +1894,7 @@ const plugin = {
         const alreadyWatching = !!existing;
         const existingFlagSucceeded = !!(existing && existing.iw4mFlag && existing.iw4mFlag.success);
         const shouldRetryFlag = alreadyWatching && !existingFlagSucceeded;
+        const flagEligibility = this.iw4mFlagEligibility(target);
         const flagResult = alreadyWatching && !shouldRetryFlag
             ? {
                 attempted: false,
@@ -1814,14 +1902,26 @@ const plugin = {
                 duplicate: true,
                 message: 'Already watching; IW4MAdmin flag was not sent again.'
             }
-            : this.iw4mAdminFlagService(originClient || null, originId || '').flagWatch(target, admin, reason);
+            : (flagEligibility.eligible
+                ? this.iw4mAdminFlagService(originClient || null, originId || '').flagWatch(target, admin, reason)
+                : {
+                    attempted: false,
+                    success: false,
+                    configured: true,
+                    skippedForConfidence: true,
+                    message: flagEligibility.reason,
+                    reason: reason,
+                    target: this.flagTargetSummary(target)
+                });
 
         const record = this.actionRecord(target, 'watch', admin, now, reason, {
             actionType: 'watch',
             iw4mFlagAttempted: !!flagResult.attempted,
             iw4mFlagSucceeded: !!flagResult.success,
             iw4mFlagMessage: flagResult.message || '',
-            iw4mFlag: flagResult
+            iw4mFlag: flagResult,
+            iw4mFlagEligible: !!flagEligibility.eligible,
+            iw4mFlagEligibilityReason: flagEligibility.reason || ''
         });
 
         state.watches[watchKey] = Object.assign({}, existing || {}, {
@@ -1837,6 +1937,8 @@ const plugin = {
             lastRequestedAt: now,
             lastRequestedBy: admin,
             iw4mFlag: flagResult,
+            iw4mFlagEligible: !!flagEligibility.eligible,
+            iw4mFlagEligibilityReason: flagEligibility.reason || '',
             actionCount: Number(existing && existing.actionCount || 0) + 1
         });
         delete state.clears[watchKey];
@@ -1866,7 +1968,7 @@ const plugin = {
             message: flagResult.attempted ? 'Player marked as Watching locally, but IW4MAdmin flag failed.' : 'Player marked as Watching.',
             detail: flagResult.attempted
                 ? `Marked locally, but IW4MAdmin flag failed. ${flagResult.message || ''}`
-                : (flagResult.message || 'Marked as watching locally, but IW4MAdmin flag integration is not configured.')
+                : (flagResult.message || 'Marked as watching locally. IW4MAdmin flag was skipped because this case is not high-confidence yet.')
         };
     },
 
@@ -1927,6 +2029,7 @@ const plugin = {
 
         const state = this.readWatchState();
         const key = this.watchKey(target);
+        const existingWatch = state.watches[key];
         if (state.clears[key]) {
             return {
                 success: true,
@@ -1938,6 +2041,16 @@ const plugin = {
         const now = new Date().toISOString();
         const admin = this.adminNameFromOrigin(originId);
         const reason = `Marked as cleared by ${admin} @ ${this.formatActionTime(now)} via Anticheat Panel.`;
+        const unflagResult = existingWatch && existingWatch.iw4mFlag && existingWatch.iw4mFlag.success
+            ? this.unflagWatchInIw4mDatabase(target, existingWatch, reason)
+            : {
+                attempted: false,
+                success: false,
+                configured: true,
+                message: existingWatch
+                    ? 'Local Watch marker was cleared. No successful IW4MAdmin Watch flag was recorded, so no IW4MAdmin unflag was queued.'
+                    : 'No local Watch marker existed, so no IW4MAdmin unflag was queued.'
+            };
         state.clears[key] = {
             caseId: target.caseId,
             playerGuid: target.guid || '',
@@ -1947,17 +2060,24 @@ const plugin = {
             status: 'cleared',
             reason: reason,
             clearedAt: now,
-            clearedBy: admin
+            clearedBy: admin,
+            iw4mUnflag: unflagResult
         };
         delete state.watches[key];
 
-        this.pushActionRecord(state, this.actionRecord(target, 'clear', admin, now, reason));
+        this.pushActionRecord(state, this.actionRecord(target, 'clear', admin, now, reason, {
+            actionType: 'clear',
+            iw4mFlagAttempted: !!unflagResult.attempted,
+            iw4mFlagSucceeded: !!unflagResult.success,
+            iw4mFlagMessage: unflagResult.message || '',
+            iw4mFlag: unflagResult
+        }));
         this.writeWatchState(state);
 
         return {
             success: true,
             message: 'Case marked as cleared.',
-            detail: 'Evidence was preserved for history.'
+            detail: `Evidence was preserved for history. ${unflagResult.message || ''}`
         };
     },
 
@@ -2748,16 +2868,16 @@ const plugin = {
             return 'recoil_suspicion';
         }
 
+        if (text.indexOf('snap') !== -1 || text.indexOf('aim') !== -1 || text.indexOf('angle') !== -1 || text.indexOf('quickscope') !== -1 || text.indexOf('sniper') !== -1) {
+            return 'aim_suspicion';
+        }
+
         if (text.indexOf('esp') !== -1 || text.indexOf('wall') !== -1 || text.indexOf('pre-aim') !== -1) {
             return 'esp_suspicion';
         }
 
         if (text.indexOf('poor') !== -1 || text.indexOf('line-of-sight') !== -1 || text.indexOf('line of sight') !== -1 || text.indexOf('visible') !== -1) {
             return 'poor_los';
-        }
-
-        if (text.indexOf('snap') !== -1 || text.indexOf('aim') !== -1 || text.indexOf('angle') !== -1) {
-            return 'aim_suspicion';
         }
 
         return 'manual_note';
@@ -2769,7 +2889,7 @@ const plugin = {
         if (text.indexOf('silent') !== -1) {
             return 'silent_aim';
         }
-        if (text.indexOf('snap') !== -1 || text.indexOf('aim assist') !== -1 || text.indexOf('aim lock') !== -1) {
+        if (text.indexOf('snap') !== -1 || text.indexOf('aim assist') !== -1 || text.indexOf('aim lock') !== -1 || text.indexOf('quickscope') !== -1 || text.indexOf('sniper snap') !== -1) {
             return 'aim_snap';
         }
         if (text.indexOf('recoil') !== -1) {
@@ -2811,6 +2931,8 @@ const plugin = {
             text.indexOf('aim assist') !== -1 ||
             text.indexOf('silent aim') !== -1 ||
             text.indexOf('snap') !== -1 ||
+            text.indexOf('quickscope') !== -1 ||
+            text.indexOf('sniper head') !== -1 ||
             text.indexOf('no recoil') !== -1;
     },
 
@@ -2864,6 +2986,14 @@ const plugin = {
         const poorLos = String(item.lineOfSight || '').toLowerCase().indexOf('poor') !== -1 || text.indexOf('poor/no clear') !== -1;
         const projectile = this.isProjectileOrExplosiveWeapon(weapon);
         const closeRange = distance > 0 && distance < 250;
+        const aimLockText = text.indexOf('aim lock') !== -1 ||
+            text.indexOf('aim assist') !== -1 ||
+            text.indexOf('snap-lock') !== -1 ||
+            text.indexOf('ads snapped') !== -1 ||
+            text.indexOf('ads aim') !== -1;
+        const sniperSampleText = text.indexOf('sniper snap-kill pattern') !== -1 ||
+            text.indexOf('quickscope sniper kills') !== -1 ||
+            text.indexOf('sniper head/neck hit rate') !== -1;
 
         let risk = raw;
         let confidence = 35;
@@ -2881,8 +3011,8 @@ const plugin = {
             risk = Math.max(risk, poorLos ? 62 : 50);
             confidence = poorLos ? 45 : 38;
         } else if (eventType === 'aim_suspicion' || eventType === 'recoil_suspicion') {
-            risk = Math.max(risk, angle >= 60 ? 68 : 48);
-            confidence = eventType === 'recoil_suspicion' ? 62 : 50;
+            risk = Math.max(risk, aimLockText ? 62 : (angle >= 60 ? 68 : 48));
+            confidence = eventType === 'recoil_suspicion' ? 62 : (aimLockText ? 58 : 50);
         }
 
         if (text.indexOf('many kills') !== -1 || text.indexOf('repeated') !== -1 || text.indexOf('pattern') !== -1) {
@@ -2893,6 +3023,26 @@ const plugin = {
         if (text.indexOf('headshot') !== -1 || text.indexOf('precise') !== -1 || text.indexOf('very precise') !== -1) {
             risk += 6;
             confidence += hard ? 5 : 2;
+        }
+
+        if (aimLockText && text.indexOf('repeated') !== -1) {
+            risk += 14;
+            confidence += 12;
+        } else if (aimLockText && text.indexOf('pattern') !== -1 && text.indexOf('many kills') !== -1) {
+            risk += 14;
+            confidence += 10;
+        } else if (aimLockText) {
+            risk += 6;
+            confidence += 4;
+        }
+
+        if (sniperSampleText) {
+            risk += 12;
+            confidence += 10;
+
+            if (text.indexOf('confidence reduced') !== -1) {
+                confidence -= 8;
+            }
         }
 
         if ((eventType === 'esp_suspicion' || eventType === 'poor_los') && poorLos) {
@@ -3374,6 +3524,21 @@ const plugin = {
         const categories = Number(item.suspiciousCategories || this.suspiciousCategoryCount(item.events || [], reports, item.hardDetectionCount || 0));
         const softEsp = (item.events || [item]).filter(event => this.isSoftEspOrLosEvent(event)).length > 0;
         const strongAimSupport = (item.events || [item]).filter(event => this.hasStrongAimAngle(event) || this.isAimLockLikeEvent(event)).length;
+        const text = this.eventText(item);
+        const aimLockEvidenceCount = (item.events || [item]).filter(event => {
+            const eventText = this.eventText(event);
+            return this.isAimLockLikeEvent(event) &&
+                (eventText.indexOf('snap-lock') !== -1 ||
+                    eventText.indexOf('ads snapped') !== -1 ||
+                    eventText.indexOf('ads aim stayed tightly') !== -1 ||
+                    eventText.indexOf('near-perfect aim') !== -1);
+        }).length;
+        const aimLockPattern = this.isAimLockLikeEvent(item) &&
+            (text.indexOf('snap-lock') !== -1 || text.indexOf('aim lock') !== -1 || text.indexOf('aim assist') !== -1) &&
+            (text.indexOf('many kills') !== -1 || text.indexOf('repeated') !== -1 || text.indexOf('pattern') !== -1);
+        const strongSingleAimLock = text.indexOf('near-perfect aim') !== -1 ||
+            text.indexOf('ads aim stayed tightly locked') !== -1 ||
+            text.indexOf('ads snapped onto a bot') !== -1;
 
         const independentlySupported = hard ||
             reports > 0 ||
@@ -3386,6 +3551,10 @@ const plugin = {
         }
 
         if (!softEsp && (risk >= 85 || (risk >= 70 && confidence >= 70))) {
+            return 'High Priority';
+        }
+
+        if (aimLockPattern && risk >= 75 && confidence >= 65 && (aimLockEvidenceCount >= 2 || reports > 0 || strongSingleAimLock)) {
             return 'High Priority';
         }
 
@@ -3644,6 +3813,18 @@ const plugin = {
         return `<a class="font-semibold text-primary underline hover:text-primary-light" href="/client/${encodeURIComponent(profileId)}">${name}</a>`;
     },
 
+    victimLink: function (victimName) {
+        const name = this.clean(victimName || 'Not available');
+        const escapedName = this.escape(name || 'Not available');
+        const profileId = this.profileIdForVictimName(name);
+
+        if (!profileId) {
+            return escapedName;
+        }
+
+        return `<a class="text-primary underline hover:text-primary-light" href="/client/${encodeURIComponent(profileId)}">${escapedName}</a>`;
+    },
+
     profileIdFor: function (item) {
         if (item && item.profileId && item.profileId !== 'Unknown') {
             return String(item.profileId);
@@ -3672,6 +3853,43 @@ const plugin = {
         }
 
         return this.profileIdFromMap(guid);
+    },
+
+    profileIdForVictimName: function (victimName) {
+        const normalized = this.normalizedPlayerName(victimName);
+        if (!normalized || normalized === 'unknown' || normalized === 'not available') {
+            return '';
+        }
+
+        try {
+            const io = importNamespace('System.IO');
+            const path = String(this.settings.clientMapPath || '/app/Logs/iw4m-client-map.json');
+            if (!io.File.Exists(path)) {
+                return '';
+            }
+
+            const map = JSON.parse(String(io.File.ReadAllText(path)));
+            const clients = map.clients || {};
+            let match = null;
+
+            Object.keys(clients).forEach(guid => {
+                const client = clients[guid] || {};
+                const clientName = this.normalizedPlayerName(client.name || client.cleanedName || client.Name || client.CleanedName || '');
+                if (clientName === normalized && client.clientId) {
+                    if (match === null) {
+                        match = String(client.clientId);
+                    } else if (match !== String(client.clientId)) {
+                        match = '';
+                    }
+                }
+            });
+
+            return match || '';
+        } catch (ex) {
+            this.logger.logWarning('{Name} failed to resolve victim profile id from client map: {Message}', this.name, ex.message || ex);
+        }
+
+        return '';
     },
 
     profileIdFromMap: function (guid) {
@@ -4290,6 +4508,10 @@ const plugin = {
 
     stripColors: function (value) {
         return this.clean(value).replace(/\^[0-9:;]/g, '');
+    },
+
+    normalizedPlayerName: function (value) {
+        return this.stripColors(value).toLowerCase().replace(/\s+/g, ' ').trim();
     },
 
     clean: function (value) {

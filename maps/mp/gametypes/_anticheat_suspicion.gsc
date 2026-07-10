@@ -76,12 +76,19 @@ acs_setupPlayer()
     self.acs_recent_headshots = 0;
     self.acs_recent_lockon_kills = 0;
     self.acs_recent_ads_precise_bot_kills = 0;
+    self.acs_recent_ads_snaplock_kills = 0;
+    self.acs_recent_sniper_kills = 0;
+    self.acs_recent_sniper_headshots = 0;
+    self.acs_recent_sniper_snap_kills = 0;
+    self.acs_recent_sniper_quickscope_kills = 0;
+    self.acs_recent_sniper_suspicious_events = 0;
     self.acs_recent_shots = 0;
     self.acs_recent_hits = 0;
     self.acs_last_alert_time = 0;
     self.acs_last_decay_time = getTime();
     self.acs_last_weapon_fire_time = 0;
     self.acs_last_unsuppressed_fire_time = 0;
+    self.acs_last_ads_start_time = 0;
     self.acs_last_visible_time = 0;
     self.acs_first_visible_time = 0;
     self.acs_wh_enabled = false;
@@ -453,7 +460,10 @@ acs_watchAimSnaps()
         }
 
         if (isAds && !self.acs_was_ads)
+        {
+            self.acs_last_ads_start_time = getTime();
             self acs_checkAdsLockTransition(self.acs_last_yaw, angles[1]);
+        }
 
         if (isAds && totalDelta >= 12)
             self acs_checkAdsLockTransition(self.acs_last_yaw, angles[1]);
@@ -585,6 +595,20 @@ acs_processKill(victim, weapon, meansOfDeath, hitLoc)
     adsBotPrecisionSignal = 0;
     uavContextSignal = 0;
     radarPingContextSignal = 0;
+    sniperSignal = 0;
+    isSniperKill = acs_isSniperWeapon(weapon);
+    sniperAdsMs = 9999;
+
+    if (isDefined(self.acs_last_ads_start_time) && self.acs_last_ads_start_time > 0)
+        sniperAdsMs = now - self.acs_last_ads_start_time;
+
+    if (isSniperKill)
+    {
+        self.acs_recent_sniper_kills++;
+
+        if (hitLoc == "head" || hitLoc == "helmet" || hitLoc == "neck")
+            self.acs_recent_sniper_headshots++;
+    }
 
     if (distance > 350 && angleMismatch >= 75)
     {
@@ -748,6 +772,72 @@ acs_processKill(victim, weapon, meansOfDeath, hitLoc)
         reasons = acs_addReason(reasons, "Several headshot kills in a short window");
     }
 
+    if (isSniperKill && distance > 300)
+    {
+        sniperMechanicalSignal = 0;
+
+        if (isDefined(self.acs_last_snap_time) && now - self.acs_last_snap_time <= 550 && self.acs_last_snap_delta >= 45)
+        {
+            self.acs_recent_sniper_snap_kills++;
+            sniperMechanicalSignal = 1;
+        }
+
+        if (sniperAdsMs <= 450 && self AdsButtonPressed())
+        {
+            self.acs_recent_sniper_quickscope_kills++;
+
+            if (isDefined(self.acs_last_snap_time) && now - self.acs_last_snap_time <= 650 && self.acs_last_snap_delta >= 35)
+                sniperMechanicalSignal = 1;
+        }
+
+        sniperHeadRatio = 0;
+        if (self.acs_recent_sniper_kills >= 1)
+            sniperHeadRatio = int((self.acs_recent_sniper_headshots * 100) / self.acs_recent_sniper_kills);
+
+        if (sniperMechanicalSignal && self.acs_recent_sniper_kills >= 4)
+        {
+            if (self.acs_recent_sniper_snap_kills >= 3)
+            {
+                self.acs_recent_sniper_suspicious_events++;
+                sniperSignal = 1;
+                aimSignal = 1;
+                strongScore += 28;
+                reasons = acs_addReason(reasons, "Repeated sniper snap-kill pattern (" + self.acs_recent_sniper_snap_kills + " recent sniper kills had fast aim snaps)");
+            }
+
+            if (self.acs_recent_sniper_quickscope_kills >= 4 && sniperHeadRatio >= 55)
+            {
+                self.acs_recent_sniper_suspicious_events++;
+                sniperSignal = 1;
+                aimSignal = 1;
+                strongScore += 24;
+                reasons = acs_addReason(reasons, "Repeated quickscope sniper kills with unusually high head/neck rate (" + sniperHeadRatio + "% over " + self.acs_recent_sniper_kills + " sniper kills)");
+            }
+            else if (self.acs_recent_sniper_quickscope_kills >= 5)
+            {
+                sniperSignal = 1;
+                weakScore += 10;
+                reasons = acs_addReason(reasons, "Many quickscope sniper kills in the recent sample");
+            }
+        }
+
+        if (self.acs_recent_sniper_kills >= 6 && sniperHeadRatio >= 70)
+        {
+            self.acs_recent_sniper_suspicious_events++;
+            sniperSignal = 1;
+            aimSignal = 1;
+            strongScore += 22;
+            reasons = acs_addReason(reasons, "Sniper head/neck hit rate is unusually high in the recent sample (" + sniperHeadRatio + "% over " + self.acs_recent_sniper_kills + " sniper kills)");
+        }
+
+        if (sniperSignal && hasLos && visibleMs > 2200 && !scriptedLockSignal && !adsLockSignal)
+        {
+            strongScore = int(strongScore * 0.65);
+            weakScore = int(weakScore * 0.80);
+            reasons = acs_addReason(reasons, "Clear long visibility could explain some sniper kills; confidence reduced");
+        }
+    }
+
     if (level.acs_include_bots && acs_isBot(victim) && distance > 250 && angleMismatch <= 8 && (aimSignal || preAimSignal || hiddenCrosshairSignal || hiddenPursuitSignal || scriptedLockSignal))
     {
         self.acs_recent_lockon_kills++;
@@ -766,7 +856,7 @@ acs_processKill(victim, weapon, meansOfDeath, hitLoc)
         }
     }
 
-    if (level.acs_include_bots && acs_isBot(victim) && distance > 250 && angleMismatch <= 6 && self AdsButtonPressed())
+    if (level.acs_include_bots && acs_isBot(victim) && distance > 250 && angleMismatch <= 15 && self AdsButtonPressed())
     {
         botSnapSignal = false;
 
@@ -781,19 +871,31 @@ acs_processKill(victim, weapon, meansOfDeath, hitLoc)
         // recent snap/lock signal that looks like automated aim correction.
         if (botSnapSignal)
         {
-            self.acs_recent_ads_precise_bot_kills++;
+            self.acs_recent_ads_snaplock_kills++;
             adsBotPrecisionSignal = 1;
             aimSignal = 1;
 
             if (angleMismatch <= 4 && isDefined(self.acs_last_snap_time) && now - self.acs_last_snap_time <= 550 && self.acs_last_snap_delta >= 45)
             {
+                self.acs_recent_ads_precise_bot_kills++;
                 strongScore += 85;
                 reasons = acs_addReason(reasons, "ADS snapped onto a bot with near-perfect aim before the kill (" + self.acs_last_snap_delta + " degree snap, " + angleMismatch + " degree final aim)");
             }
-            else if (self.acs_recent_ads_precise_bot_kills >= 2)
+            else if (self.acs_recent_ads_snaplock_kills >= 2)
             {
-                strongScore += 85;
-                reasons = acs_addReason(reasons, "Repeated ADS snap-lock kills on bots with near-perfect aim alignment (" + self.acs_recent_ads_precise_bot_kills + " bot kills, latest " + angleMismatch + " degrees)");
+                strongScore += 65;
+                reasons = acs_addReason(reasons, "Repeated ADS snap-lock kills on bots with tight aim alignment (" + self.acs_recent_ads_snaplock_kills + " bot kills, latest " + angleMismatch + " degrees, snap " + self.acs_last_snap_delta + " degrees)");
+            }
+            else
+            {
+                strongScore += 34;
+                reasons = acs_addReason(reasons, "ADS snap-lock pattern on a bot before the kill (" + self.acs_last_snap_delta + " degree snap, " + angleMismatch + " degree final aim)");
+            }
+
+            if (hitLoc == "head" || hitLoc == "helmet")
+            {
+                weakScore += 10;
+                reasons = acs_addReason(reasons, "ADS snap-lock kill landed as a headshot");
             }
         }
     }
@@ -826,10 +928,10 @@ acs_processKill(victim, weapon, meansOfDeath, hitLoc)
 
     // A single noisy angle/LOS mismatch is useful context, but by itself it is
     // too weak to log as suspicious gameplay. Require a behavioral signal.
-    if (strongScore <= 0 && !aimSignal && !preAimSignal && !hiddenCrosshairSignal && !hiddenPursuitSignal && !scriptedLockSignal && !adsBotPrecisionSignal)
+    if (strongScore <= 0 && !aimSignal && !preAimSignal && !hiddenCrosshairSignal && !hiddenPursuitSignal && !scriptedLockSignal && !adsBotPrecisionSignal && !sniperSignal)
         weakScore = 0;
 
-    if (hasLos && visibleMs > 2500 && !adsLockSignal && !preAimSignal && !hiddenCrosshairSignal && !hiddenPursuitSignal && !scriptedLockSignal && !adsBotPrecisionSignal && strongScore <= 0 && weakScore < 12)
+    if (hasLos && visibleMs > 2500 && !adsLockSignal && !preAimSignal && !hiddenCrosshairSignal && !hiddenPursuitSignal && !scriptedLockSignal && !adsBotPrecisionSignal && !sniperSignal && strongScore <= 0 && weakScore < 12)
         weakScore = 0;
 
     score = strongScore + weakScore;
@@ -1222,6 +1324,20 @@ acs_ignoreKillType(weapon, meansOfDeath)
     return false;
 }
 
+acs_isSniperWeapon(weapon)
+{
+    if (!isDefined(weapon))
+        return false;
+
+    if (isSubStr(weapon, "barrett") || isSubStr(weapon, "wa2000") || isSubStr(weapon, "m21") || isSubStr(weapon, "cheytac") || isSubStr(weapon, "intervention"))
+        return true;
+
+    if (isSubStr(weapon, "l96") || isSubStr(weapon, "dragunov") || isSubStr(weapon, "m40a3") || isSubStr(weapon, "remington700"))
+        return true;
+
+    return false;
+}
+
 acs_isUsingHeartbeatSensor()
 {
     weapon = self getCurrentWeapon();
@@ -1354,6 +1470,21 @@ acs_decayScore()
 
         if (self.acs_recent_hidden_crosshair_kills > 0)
             self.acs_recent_hidden_crosshair_kills--;
+
+        if (self.acs_recent_sniper_kills > 0)
+            self.acs_recent_sniper_kills--;
+
+        if (self.acs_recent_sniper_headshots > 0)
+            self.acs_recent_sniper_headshots--;
+
+        if (self.acs_recent_sniper_snap_kills > 0)
+            self.acs_recent_sniper_snap_kills--;
+
+        if (self.acs_recent_sniper_quickscope_kills > 0)
+            self.acs_recent_sniper_quickscope_kills--;
+
+        if (self.acs_recent_sniper_suspicious_events > 0)
+            self.acs_recent_sniper_suspicious_events--;
     }
 }
 
