@@ -44,6 +44,10 @@ function loadConfig() {
     webhookUrl: config.webhookUrl,
     mention: config.mention || '@here',
     cooldownMs: Number(config.cooldownMs || 90000),
+    minDiscordScore: Number(config.minDiscordScore || 100),
+    minDiscordStrongSignals: Number(config.minDiscordStrongSignals || 1),
+    minDiscordEvidenceEvents: Number(config.minDiscordEvidenceEvents || 2),
+    allowIncompleteMetricAlerts: config.allowIncompleteMetricAlerts === true,
     acLogFile: config.acLogFile || path.join(__dirname, 'logs', 'anti-cheat-combined.log'),
     databaseFile: config.databaseFile || '/home/mw2-cluster/base_files/data/iw4madmin/Database/Database.db',
     clientMapFile: config.clientMapFile || '/home/mw2-cluster/base_files/data/iw4madmin/Logs/iw4m-client-map.json',
@@ -592,6 +596,23 @@ function shouldSendDiscordAlert(event, evidence) {
   const signals = signalSummary(event, evidence);
   const fpRisk = falsePositiveRisk(event, evidence);
   const evidenceCount = evidence.length || 1;
+  const hasMetrics = hasCompleteReviewMetrics(event, evidence);
+
+  if (score < config.minDiscordScore) {
+    return false;
+  }
+
+  if (strong < config.minDiscordStrongSignals && score < 180) {
+    return false;
+  }
+
+  if (evidenceCount < config.minDiscordEvidenceEvents && score < 150) {
+    return false;
+  }
+
+  if (!hasMetrics && !config.allowIncompleteMetricAlerts) {
+    return false;
+  }
 
   if (score >= 180) {
     return true;
@@ -614,6 +635,21 @@ function shouldSendDiscordAlert(event, evidence) {
   }
 
   return false;
+}
+
+function hasCompleteReviewMetrics(event, evidence) {
+  const events = evidence && evidence.length ? evidence : [event];
+
+  return events.some(item => {
+    const distance = Number(item.distance || 0);
+    const angle = Number(item.angleMismatch || 0);
+    const visible = Number(item.visibleMs || 0);
+    const hasDistance = Number.isFinite(distance) && distance > 0;
+    const hasAngle = Number.isFinite(angle) && angle >= 0;
+    const hasVisible = Number.isFinite(visible) && visible >= 0 && String(item.visibleMs || '') !== '';
+
+    return hasDistance && hasAngle && hasVisible;
+  });
 }
 
 function probabilityLabel(event, evidence) {

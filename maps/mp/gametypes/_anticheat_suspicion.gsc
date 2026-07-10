@@ -267,7 +267,7 @@ acs_trackHiddenCrosshair(target, key, now)
     if (!self acs_isEnemyTarget(target))
         return;
 
-    if (self acs_isUsingHeartbeatSensor())
+    if (self acs_heartbeatCanExplainTarget(target))
     {
         self acs_clearHiddenCrosshair(key);
         return;
@@ -319,7 +319,7 @@ acs_trackHiddenPursuit(target, key, now)
     if (!self acs_isEnemyTarget(target))
         return;
 
-    if (self acs_isUsingHeartbeatSensor())
+    if (self acs_heartbeatCanExplainTarget(target))
     {
         self acs_clearHiddenPursuit(key);
         return;
@@ -687,7 +687,7 @@ acs_processKill(victim, weapon, meansOfDeath, hitLoc)
 
     if (!hasLos && isDefined(self.acs_last_hidden_crosshair_time) && now - self.acs_last_hidden_crosshair_time <= 2200)
     {
-        if (self.acs_last_hidden_crosshair_target == victim getEntityNumber() && !self acs_isUsingHeartbeatSensor())
+        if (self.acs_last_hidden_crosshair_target == victim getEntityNumber() && !self acs_heartbeatCanExplainTarget(victim))
         {
             self.acs_recent_hidden_crosshair_kills++;
             hiddenCrosshairSignal = 1;
@@ -703,16 +703,22 @@ acs_processKill(victim, weapon, meansOfDeath, hitLoc)
                 strongScore += 24;
                 reasons = acs_addReason(reasons, "Held crosshair on this hidden target before killing them (" + self.acs_last_hidden_crosshair_duration + "ms within " + self.acs_last_hidden_crosshair_mismatch + " degrees)");
             }
+
+            if (self acs_isUsingHeartbeatSensor() && victim acs_hasNinja())
+                reasons = acs_addReason(reasons, "Victim had Ninja, so heartbeat sensor did not explain the hidden-target read");
         }
     }
 
     if (!hasLos && isDefined(self.acs_last_hidden_pursuit_time) && now - self.acs_last_hidden_pursuit_time <= 2500)
     {
-        if (self.acs_last_hidden_pursuit_target == victim getEntityNumber() && !self acs_isUsingHeartbeatSensor())
+        if (self.acs_last_hidden_pursuit_target == victim getEntityNumber() && !self acs_heartbeatCanExplainTarget(victim))
         {
             strongScore += 22;
             hiddenPursuitSignal = 1;
             reasons = acs_addReason(reasons, "Moved directly toward a hidden target before killing them (" + self.acs_last_hidden_pursuit_duration + "ms, aim within " + self.acs_last_hidden_pursuit_mismatch + " degrees)");
+
+            if (self acs_isUsingHeartbeatSensor() && victim acs_hasNinja())
+                reasons = acs_addReason(reasons, "Victim had Ninja, so heartbeat sensor did not explain the hidden-target push");
         }
     }
 
@@ -1348,6 +1354,37 @@ acs_isUsingHeartbeatSensor()
     return isSubStr(weapon, "heartbeat");
 }
 
+acs_heartbeatCanExplainTarget(target)
+{
+    if (!self acs_isUsingHeartbeatSensor())
+        return false;
+
+    if (!isDefined(target))
+        return false;
+
+    if (target acs_hasNinja())
+        return false;
+
+    return true;
+}
+
+acs_hasNinja()
+{
+    if (!isPlayer(self))
+        return false;
+
+    if (self _hasPerk("specialty_heartbreaker"))
+        return true;
+
+    if (self _hasPerk("specialty_heartbreaker_upgrade"))
+        return true;
+
+    if (self _hasPerk("upgraded_specialty_heartbreaker"))
+        return true;
+
+    return false;
+}
+
 acs_weaponHasSuppressor(weapon)
 {
     if (!isDefined(weapon))
@@ -1367,15 +1404,46 @@ acs_weaponHasSuppressor(weapon)
 
 acs_recentTeamUavActive()
 {
-    if (!isDefined(level.acs_last_team_uav_time))
-        return false;
-
     if (!isDefined(self.pers) || !isDefined(self.pers["team"]))
         return false;
 
     team = self.pers["team"];
 
+    // Prefer the stock UAV script's live state. In maps/mp/killstreaks/_uav.gsc,
+    // level.activeUAVs is incremented when UAV starts and decremented when the
+    // UAV expires or is destroyed. Counter UAV blocks the opposing team's radar.
+    if (isDefined(level.teamBased) && level.teamBased)
+    {
+        if (team == "spectator" || team == "none")
+            return false;
+
+        if (self acs_attackerRadarBlocked())
+            return false;
+
+        if (isDefined(level.activeUAVs) && isDefined(level.activeUAVs[team]) && level.activeUAVs[team] > 0)
+            return true;
+    }
+    else
+    {
+        // FFA/non-team UAV state is tracked per player in the stock UAV script.
+        if (isDefined(self.hasRadar) && self.hasRadar)
+        {
+            if (isDefined(self.isRadarBlocked) && self.isRadarBlocked)
+                return false;
+
+            return true;
+        }
+    }
+
+    // Fallback for servers that log killstreak usage but do not expose the stock
+    // UAV arrays to this script. This is less exact and assumes a 30s window.
+    if (!isDefined(level.acs_last_team_uav_time))
+        return false;
+
     if (!isDefined(level.acs_last_team_uav_time[team]))
+        return false;
+
+    if (self acs_attackerRadarBlocked())
         return false;
 
     return getTime() - level.acs_last_team_uav_time[team] <= 30000;
@@ -1403,6 +1471,16 @@ acs_radarBlockedByTargetTeam(victim)
     team = victim.pers["team"];
     now = getTime();
 
+    if (isDefined(level.teamBased) && level.teamBased)
+    {
+        if (isDefined(level.activeCounterUAVs) && isDefined(level.activeCounterUAVs[team]) && level.activeCounterUAVs[team] > 0)
+            return true;
+    }
+    else if (isDefined(self.isRadarBlocked) && self.isRadarBlocked)
+    {
+        return true;
+    }
+
     if (isDefined(level.acs_last_team_counter_uav_time) && isDefined(level.acs_last_team_counter_uav_time[team]))
     {
         if (now - level.acs_last_team_counter_uav_time[team] <= 30000)
@@ -1412,6 +1490,49 @@ acs_radarBlockedByTargetTeam(victim)
     if (isDefined(level.acs_last_team_emp_time) && isDefined(level.acs_last_team_emp_time[team]))
     {
         if (now - level.acs_last_team_emp_time[team] <= 60000)
+            return true;
+    }
+
+    return false;
+}
+
+acs_attackerRadarBlocked()
+{
+    if (!isDefined(self.pers) || !isDefined(self.pers["team"]))
+        return false;
+
+    team = self.pers["team"];
+    now = getTime();
+
+    if (!isDefined(level.teamBased) || !level.teamBased)
+    {
+        if (isDefined(self.isRadarBlocked) && self.isRadarBlocked)
+            return true;
+
+        return false;
+    }
+
+    if (isDefined(level.otherTeam) && isDefined(level.otherTeam[team]))
+    {
+        otherTeam = level.otherTeam[team];
+
+        if (isDefined(level.activeCounterUAVs) && isDefined(level.activeCounterUAVs[otherTeam]) && level.activeCounterUAVs[otherTeam] > 0)
+            return true;
+    }
+
+    if (isDefined(level.acs_last_team_counter_uav_time) && isDefined(level.otherTeam) && isDefined(level.otherTeam[team]))
+    {
+        otherTeamFallback = level.otherTeam[team];
+
+        if (isDefined(level.acs_last_team_counter_uav_time[otherTeamFallback]) && now - level.acs_last_team_counter_uav_time[otherTeamFallback] <= 30000)
+            return true;
+    }
+
+    if (isDefined(level.acs_last_team_emp_time) && isDefined(level.otherTeam) && isDefined(level.otherTeam[team]))
+    {
+        empTeam = level.otherTeam[team];
+
+        if (isDefined(level.acs_last_team_emp_time[empTeam]) && now - level.acs_last_team_emp_time[empTeam] <= 60000)
             return true;
     }
 

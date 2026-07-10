@@ -579,7 +579,7 @@ const plugin = {
                             ${this.playerLink(item)}
                             <span class="${this.badgeClass(status)}">${this.escape(status)}</span>
                         </div>
-                        <div class="ac-muted-line">GUID ${this.escape(item.guid || 'Unknown')} / Client ${this.escape(item.client || 'Unknown')}</div>
+                        <div class="ac-muted-line">GUID ${this.escape(item.guid || 'Unknown')}</div>
                         <div class="ac-muted-line">${this.escape(item.server || item.serverKey || 'Unknown server')} · ${this.escape(item.map || 'Unknown map')} · ${this.localTimeElement(item.time, item.displayTime)}</div>
                     </div>
                     <div class="ac-case-main">
@@ -637,7 +637,6 @@ const plugin = {
                                 ${this.evidenceItem('Distance', item.distance || 'Unknown')}
                                 ${this.evidenceItem('Angle', item.angle || 'Unknown')}
                                 ${this.evidenceItem('Line of Sight', item.lineOfSight || 'Unknown')}
-                                ${this.evidenceItem('Client', item.client || 'Unknown')}
                                 </div>
                             </section>
                             <section class="ac-evidence-group">
@@ -2189,9 +2188,24 @@ const plugin = {
 
     buildCases: function (items) {
         const groups = {};
+        const normalizedItems = (items || []).map((sourceItem, index) => sourceItem.eventId ? sourceItem : this.normalizeEvent(sourceItem, index));
+        const guidAliases = {};
 
-        items.forEach((sourceItem, index) => {
-            const item = sourceItem.eventId ? sourceItem : this.normalizeEvent(sourceItem, index);
+        normalizedItems.forEach(item => {
+            if (this.clean(item.playerGuid || item.guid || '').toLowerCase()) {
+                this.caseAliasKeys(item).forEach(alias => {
+                    guidAliases[alias] = item.caseId;
+                });
+            }
+        });
+
+        normalizedItems.forEach(item => {
+            const hasGuid = !!this.clean(item.playerGuid || item.guid || '').toLowerCase();
+            const aliasCaseId = !hasGuid ? this.firstAliasCaseId(item, guidAliases) : '';
+            if (aliasCaseId) {
+                item.caseId = aliasCaseId;
+            }
+
             const key = item.caseId;
 
             if (!groups[key]) {
@@ -2338,6 +2352,36 @@ const plugin = {
         const cases = Object.keys(groups).map(key => this.applyWatchState(this.finalizeCase(groups[key]), watchState));
         cases.sort((a, b) => this.riskInfo(b).score - this.riskInfo(a).score);
         return cases;
+    },
+
+    caseAliasKeys: function (item) {
+        const player = this.normalizedPlayerName(item.playerName || item.player || '');
+        const server = this.clean(item.serverName || item.server || item.serverKey || '').toLowerCase();
+        const client = this.clean(item.clientId || item.client || '').toLowerCase();
+        const profile = this.clean(item.profileId || '').toLowerCase();
+        const keys = [];
+
+        if (player && server && client && client !== 'unknown') {
+            keys.push(`player-server-client:${player}|${server}|${client}`);
+        }
+        if (player && server) {
+            keys.push(`player-server:${player}|${server}`);
+        }
+        if (profile) {
+            keys.push(`profile:${profile}`);
+        }
+
+        return keys;
+    },
+
+    firstAliasCaseId: function (item, aliases) {
+        const keys = this.caseAliasKeys(item);
+        for (let i = 0; i < keys.length; i++) {
+            if (aliases[keys[i]]) {
+                return aliases[keys[i]];
+            }
+        }
+        return '';
     },
 
     normalizeEvent: function (item, index) {
@@ -3274,7 +3318,8 @@ const plugin = {
         return [
             'fallback',
             this.clean(item.playerName || item.player || 'unknown').toLowerCase(),
-            this.clean(item.serverName || item.server || item.serverKey || 'unknown').toLowerCase()
+            this.clean(item.serverName || item.server || item.serverKey || 'unknown').toLowerCase(),
+            this.clean(item.clientId || item.client || '').toLowerCase()
         ].join(':');
     },
 
@@ -3417,7 +3462,7 @@ const plugin = {
             highPriority: cases.filter(item => this.caseStatus(item) === 'High Priority').length,
             watching: cases.filter(item => this.caseStatus(item) === 'Watching').length,
             reportsToday: items.filter(item => this.itemLooksLikeReport(item) && String(item.time || '').indexOf(today) === 0).length,
-            staleTelemetry: cases.filter(item => this.isStaleTelemetry(item)).length,
+            staleTelemetry: cases.filter(item => this.isStaleTelemetry(item) && this.riskInfo(item).score >= 70 && this.confidenceInfo(item).score >= 45).length,
             actionsTaken: cases.filter(item => item.actions > 0 || item.isAutomatedBan).length
         };
     },
@@ -3562,7 +3607,11 @@ const plugin = {
             return 'High Priority';
         }
 
-        if (risk >= 45 || item.alerts > 0 || item.reports > 0) {
+        if (risk >= 70 && confidence >= 45) {
+            return 'Needs Review';
+        }
+
+        if (reports > 0 && risk >= 45) {
             return 'Needs Review';
         }
 
@@ -4014,6 +4063,10 @@ const plugin = {
                 item.falsePositiveRisk = risk ? risk[1].trim() : '';
             } else if (line.indexOf('Latest Target: ') === 0) {
                 item.victim = line.substring(15);
+            } else if (line.indexOf('Target: ') === 0) {
+                item.victim = line.substring(8);
+            } else if (line.indexOf('Victim: ') === 0) {
+                item.victim = line.substring(8);
             } else if (line.indexOf('Weapon: ') === 0) {
                 const match = line.match(/^Weapon:\s*(.*?)\s*\|\s*Hit Location:\s*(.*?)$/);
                 if (match) {
@@ -4320,7 +4373,7 @@ const plugin = {
                 color: event.kind === 'AUTO_BAN' ? 0xfc0f03 : 0xfc4a03,
                 fields: [
                     { name: 'Player', value: event.player || 'Unknown', inline: true },
-                    { name: 'GUID / Client', value: `${event.guid || 'Unknown'} / ${event.client || '?'}`, inline: true },
+                    { name: 'GUID', value: event.guid || 'Unknown', inline: true },
                     { name: 'Action', value: event.action, inline: true },
                     { name: 'Reason', value: this.truncate(event.reason || 'No reason supplied', 900), inline: false },
                     { name: 'Server', value: event.server || 'Unknown', inline: false },
@@ -4347,7 +4400,7 @@ const plugin = {
         const caseUrl = this.caseUrl(target);
         const fields = [
             { name: 'Player', value: target.player || 'Unknown', inline: true },
-            { name: 'GUID / Client', value: `${target.guid || 'Unknown'} / ${target.client || '?'}`, inline: true },
+            { name: 'GUID', value: target.guid || 'Unknown', inline: true },
             { name: 'Risk / Confidence', value: `${risk.score}/100 / ${confidence.label}`, inline: true },
             { name: 'Server', value: target.server || 'Unknown', inline: false },
             { name: 'Map', value: target.map || target.latestMap || 'Unknown', inline: true },

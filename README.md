@@ -15,9 +15,17 @@ The GSC script tracks patterns such as:
 - Moving directly toward hidden targets
 - Fast kills immediately after visibility
 - Repeated suspicious events across one player
-- Supporting context such as UAV, Counter-UAV, EMP, heartbeat sensor, and unsuppressed weapon radar pings
+- Supporting context such as UAV, Counter-UAV, EMP, heartbeat sensor, Ninja, and unsuppressed weapon radar pings
 
 This system treats ESP/wallhack signals as **suspicion**, not proof.
+
+Radar context is handled carefully:
+
+- A team UAV can reduce ESP-style suspicion while it is active.
+- If the UAV is destroyed, the stock game script decrements `level.activeUAVs`, so the reduction stops.
+- Counter-UAV or EMP blocks the UAV/radar explanation.
+- Unsuppressed victim weapon fire can reduce suspicion only when the attacker's radar is not blocked.
+- Heartbeat sensor only explains hidden-target reads if the victim does **not** have Ninja (`specialty_heartbreaker`).
 
 ## Files
 
@@ -26,10 +34,18 @@ maps/mp/gametypes/_anticheat_suspicion.gsc
 maps/mp/gametypes/_killstreak_logger.gsc
 anticheat-discord-watcher.js
 anticheat-discord-config.example.json
+iw4m-client-map.py
 iw4madmin/Plugins/AnticheatMetrics.js
 iw4madmin/Plugins/anticheat_iw4m_flag_worker.py
 systemd/anticheat-iw4m-flag-worker.service
 ```
+
+Python is only used by optional helper scripts:
+
+- `iw4m-client-map.py` generates GUID/profile lookup data for links and victim resolution.
+- `anticheat_iw4m_flag_worker.py` is only for optional IW4MAdmin Watch flag writes.
+
+The core GSC anti-cheat and the IW4MAdmin dashboard plugin do not require Python.
 
 ## Install GSC Scripts
 
@@ -73,6 +89,11 @@ set ac_suspicion_include_bots "1"
 
 Restart the server or rotate the map after changing GSC files.
 
+Important: after replacing the GSC files, restart the IW4X game servers. After
+replacing `AnticheatMetrics.js`, restart IW4MAdmin. If the old watcher or old
+plugin stays running, Discord may still show noisy alerts from the previous
+version.
+
 ## Discord Watcher
 
 The GSC script writes `CUSTOM_AC_*` lines into the game logs. The Node helper watches the log and sends Discord alerts.
@@ -82,6 +103,7 @@ The GSC script writes `CUSTOM_AC_*` lines into the game logs. The Node helper wa
 ```text
 anticheat-discord-watcher.js
 anticheat-discord-config.example.json
+iw4m-client-map.py
 ```
 
 2. Rename the config:
@@ -92,6 +114,20 @@ cp anticheat-discord-config.example.json anticheat-discord-config.json
 
 3. Edit the webhook URL in `anticheat-discord-config.json`.
 
+Recommended Discord noise controls:
+
+```json
+"minDiscordScore": 100,
+"minDiscordStrongSignals": 1,
+"minDiscordEvidenceEvents": 2,
+"allowIncompleteMetricAlerts": false
+```
+
+This keeps weak/incomplete review lines in the local anti-cheat log without
+pinging Discord. Alerts with missing distance/angle/visibility metrics should
+not page staff unless you explicitly set `allowIncompleteMetricAlerts` to
+`true`.
+
 4. Start it:
 
 ```bash
@@ -99,6 +135,14 @@ node anticheat-discord-watcher.js
 ```
 
 Use a systemd service or process manager if you want it always running.
+
+Keep `iw4m-client-map.py` in the same folder as
+`anticheat-discord-watcher.js`. The watcher uses it to generate
+`iw4m-client-map.json`, which lets the dashboard resolve GUIDs/profile links
+and make victim names clickable when they uniquely match an IW4MAdmin client.
+
+This should run as a background service/process. It should not require an active
+SSH shell after setup.
 
 ## IW4MAdmin Dashboard
 
@@ -122,6 +166,20 @@ It groups events into player cases and separates:
 - Confidence: how reliable the evidence is
 - Reports: linked reports if report events are present in the anti-cheat log
 - Actions: Watch, Clear, Send Review
+
+If duplicate cases appear where one says `GUID Unknown` and another has a real
+GUID, restart IW4MAdmin and make sure the client map helper/watcher is running.
+The plugin will merge fallback player/server/client cases into the real GUID
+case once the GUID is known.
+
+Fields like `CapturedViewAngles`, `CurrentStrain`, `RecoilOffset`, and
+`SessionAverageSnapValue` are IW4MAdmin Stats anti-cheat snapshot fields. They
+will show `Not recorded` unless IW4MAdmin's own Stats anti-cheat is enabled and
+writing AC snapshots. The custom GSC review system still works without those
+fields, but those hard IW4MAdmin metrics will not appear.
+
+The visible case row and Discord review embed show the GUID only. IW4MAdmin
+already exposes client/profile details when you click the player profile link.
 
 ## Optional IW4MAdmin Watch Flag Worker
 
@@ -166,6 +224,7 @@ Held crosshair on this hidden target before killing them
 Repeatedly held crosshair on hidden targets before killing them
 Aimed at this target through a wall before killing them
 ADS aim stayed tightly locked on the victim after a sudden correction
+Victim had Ninja, so heartbeat sensor did not explain the hidden-target push
 ```
 
 ## Interpreting Evidence
