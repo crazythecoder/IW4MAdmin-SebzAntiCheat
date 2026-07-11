@@ -2,6 +2,7 @@ const anticheatNavKey = 'Webfront::Nav::Admin::Anticheat';
 
 const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
     registerNotify('IManagementEventSubscriptions.ClientPenaltyAdministered', (penaltyEvent, token) => plugin.onPenalty(penaltyEvent, token));
+    registerNotify('IManagementEventSubscriptions.ClientCommandExecuted', (commandEvent, token) => plugin.onCommand(commandEvent, token));
 
     plugin.onLoad(serviceResolver, configWrapper, pluginHelper);
     return plugin;
@@ -94,6 +95,30 @@ const plugin = {
         }
     },
 
+    onCommand: function (commandEvent, _) {
+        const text = String(commandEvent && (commandEvent.commandText || commandEvent.CommandText || commandEvent.data || commandEvent.Data) || '');
+        const commandName = commandEvent && commandEvent.command && commandEvent.command.name
+            ? String(commandEvent.command.name)
+            : (commandEvent && commandEvent.Command && commandEvent.Command.Name ? String(commandEvent.Command.Name) : '');
+
+        if (!/^!?report\b/i.test(text) && !/^report$/i.test(commandName)) {
+            return;
+        }
+
+        const target = this.commandTargetClient(commandEvent);
+        const reporter = commandEvent.origin || commandEvent.Origin || commandEvent.client || commandEvent.Client || null;
+
+        if (!target || !reporter) {
+            this.logger.logWarning('{Name} saw a report command but could not resolve reporter/target', this.name);
+            return;
+        }
+
+        const server = this.serverFromEvent(commandEvent, target);
+        const event = this.buildPlayerReportEvent(commandEvent, target, reporter, server, text || commandName);
+        this.appendPlayerReportLog(event);
+        this.logger.logInformation('{Name} linked IW4MAdmin report to anti-cheat queue. Reporter={Reporter}, Target={Target}, Reason={Reason}', this.name, event.reporterName, event.player, event.reason);
+    },
+
     buildInteraction: function () {
         const helpers = importNamespace('SharedLibraryCore.Helpers');
         const interactionData = new helpers.InteractionData();
@@ -145,7 +170,7 @@ const plugin = {
                 <section class="ac-metrics-strip">
                     ${this.statCard('Needs Review', stats.needsReview, 'Check soon.', 'orange')}
                     ${this.statCard('High Priority', stats.highPriority, 'Strong signals.', 'red')}
-                    ${this.statCard('Watching', stats.watching, 'Low priority.', 'blue')}
+                    ${this.statCard('Monitoring', stats.monitoring, 'Anticheat is watching.', 'blue')}
                     ${this.statCard('Reports Today', stats.reportsToday, stats.reportsToday > 0 ? 'Linked today.' : 'No reports linked today.', 'slate')}
                     ${this.statCard('Stale Telemetry', stats.staleTelemetry, stats.staleTelemetry > 0 ? 'Needs attention.' : 'Healthy.', stats.staleTelemetry > 0 ? 'orange' : 'green')}
                     ${this.statCard('Actions Taken', stats.actionsTaken, 'Already logged.', 'green')}
@@ -163,6 +188,7 @@ const plugin = {
                                         <option value="all">All</option>
                                         <option value="needs-review">Needs Review</option>
                                         <option value="high-priority">High Priority</option>
+                                        <option value="monitoring">Monitoring</option>
                                         <option value="watching">Watching</option>
                                         <option value="hard">Hard Detections</option>
                                         <option value="soft">Soft Suspicion</option>
@@ -306,6 +332,7 @@ const plugin = {
 
                             if (filter.value === 'needs-review') visible = status === 'Needs Review';
                             else if (filter.value === 'high-priority') visible = status === 'High Priority';
+                            else if (filter.value === 'monitoring') visible = status === 'Monitoring';
                             else if (filter.value === 'watching') visible = status === 'Watching';
                             else if (filter.value === 'hard') visible = hard;
                             else if (filter.value === 'soft') visible = !hard && kind !== 'AUTO_BAN' && kind !== 'AUTO_TEMPBAN';
@@ -577,7 +604,7 @@ const plugin = {
                     <div class="ac-case-person">
                         <div class="ac-person-title">
                             ${this.playerLink(item)}
-                            <span class="${this.badgeClass(status)}">${this.escape(status)}</span>
+                            ${this.statusBadge(item, status)}
                         </div>
                         <div class="ac-muted-line">GUID ${this.escape(item.guid || 'Unknown')}</div>
                         <div class="ac-muted-line">${this.escape(item.server || item.serverKey || 'Unknown server')} · ${this.escape(item.map || 'Unknown map')} · ${this.localTimeElement(item.time, item.displayTime)}</div>
@@ -646,10 +673,6 @@ const plugin = {
                                 </div>
                                 ${discordNote ? `<p class="ac-evidence-note">${this.escape(discordNote)}</p>` : ''}
                             </section>
-                            <section class="ac-evidence-group ac-interpretation">
-                                <div class="ac-section-label">Admin Interpretation</div>
-                                <p>${this.escape(this.adminInterpretation(item, hard, discord, action, evidenceType))}</p>
-                            </section>
                         </div>
                         ${this.rawDebugDetails(item, rawReasons)}
                     </details>
@@ -708,7 +731,7 @@ const plugin = {
                     <div>
                         <div class="ac-person-title">
                             ${this.playerLink(target)}
-                            <span class="${this.badgeClass(status)}">${this.escape(status)}</span>
+                            ${this.statusBadge(target, status)}
                         </div>
                         <p class="ac-profile-reason">${this.escape(target.mainReason || this.plainReason(target))}</p>
                         <div class="ac-muted-line">Client ${this.escape(target.client || 'Unknown')} · ${this.escape(target.server || 'Unknown server')} · ${this.escape(target.map || target.latestMap || 'Unknown map')}</div>
@@ -954,7 +977,6 @@ const plugin = {
             </div>`).join('');
 
         return `
-            <p class="ac-raw-helper">Technical data for deeper validation. IW4MAdmin snapshot fields are shown when available.</p>
             <div class="ac-debug-list">${rows}</div>
             <div class="ac-raw-grid">
                 <div>
@@ -2349,9 +2371,55 @@ const plugin = {
         });
 
         const watchState = this.readWatchState();
-        const cases = Object.keys(groups).map(key => this.applyWatchState(this.finalizeCase(groups[key]), watchState));
+        const cases = Object.keys(groups)
+            .map(key => this.applyWatchState(this.finalizeCase(groups[key]), watchState))
+            .filter(group => this.shouldShowCaseInReviewQueue(group));
         cases.sort((a, b) => this.riskInfo(b).score - this.riskInfo(a).score);
         return cases;
+    },
+
+    shouldShowCaseInReviewQueue: function (group) {
+        if (!group) {
+            return false;
+        }
+
+        const risk = Number(group.overallRisk || group.riskScore || 0);
+        const confidence = Number(group.confidence || group.confidenceScore || 0);
+        const events = Number(group.eventsCount || (group.events || []).length || 0);
+        const reports = Number(group.reportsCount || group.reports || 0);
+        const uniqueReporters = Number(group.uniqueReporters || 0);
+        const hard = Number(group.hardDetectionCount || 0) > 0 || this.isHardDetection(group.latest || group);
+        const actions = Number(group.actionsTakenCount || group.actions || 0);
+        const alerts = Number(group.discordAlertCount || group.alerts || 0);
+        const categories = Number(group.suspiciousCategories || this.suspiciousCategoryCount(group.events || [], reports, group.hardDetectionCount || 0));
+        const uniqueVictims = Number(group.uniqueVictims || 0);
+        const strongAimSupport = (group.events || [group]).filter(event => this.hasStrongAimAngle(event) || this.isAimLockLikeEvent(event)).length;
+
+        if (group.watchStatus === 'watching' || group.clearStatus === 'cleared') {
+            return true;
+        }
+
+        if (actions > 0 || alerts > 0 || group.kind === 'AUTO_BAN' || group.kind === 'AUTO_TEMPBAN') {
+            return true;
+        }
+
+        if (hard) {
+            return true;
+        }
+
+        if (reports > 0 && (risk >= 45 || events >= 2 || uniqueReporters >= 1)) {
+            return true;
+        }
+
+        if (risk >= 60 && confidence >= 45) {
+            return true;
+        }
+
+        if (events >= 3 && risk >= 60 && confidence >= 45 && (uniqueVictims >= 2 || categories >= 2 || strongAimSupport >= 2)) {
+            return true;
+        }
+
+        return false;
     },
 
     caseAliasKeys: function (item) {
@@ -3252,7 +3320,7 @@ const plugin = {
             return 'This case includes hard anti-cheat telemetry, which is usually stronger evidence than normal gameplay suspicion. Review the full event history before taking action.';
         }
         if (latest.eventType === 'esp_suspicion' || latest.eventType === 'poor_los' || String(latest.lineOfSight || '').toLowerCase().indexOf('poor') !== -1) {
-            return 'This is a soft ESP or line-of-sight suspicion event. Treat it as supporting evidence, not proof, unless repeated patterns or reports exist.';
+            return 'Treat this as supporting evidence, not proof, unless repeated patterns or reports exist.';
         }
         if (this.isProjectileOrExplosiveWeapon(latest.weapon)) {
             return 'This event may have reduced reliability because projectile or explosive weapons can make aim-angle evidence less trustworthy.';
@@ -3460,6 +3528,7 @@ const plugin = {
         return {
             needsReview: cases.filter(item => this.caseStatus(item) === 'Needs Review').length,
             highPriority: cases.filter(item => this.caseStatus(item) === 'High Priority').length,
+            monitoring: cases.filter(item => this.caseStatus(item) === 'Monitoring').length,
             watching: cases.filter(item => this.caseStatus(item) === 'Watching').length,
             reportsToday: items.filter(item => this.itemLooksLikeReport(item) && String(item.time || '').indexOf(today) === 0).length,
             staleTelemetry: cases.filter(item => this.isStaleTelemetry(item) && this.riskInfo(item).score >= 70 && this.confidenceInfo(item).score >= 45).length,
@@ -3565,11 +3634,14 @@ const plugin = {
         const confidence = this.confidenceInfo(item).score;
         const hard = Number(item.hardDetectionCount || 0) > 0 || this.isHardDetection(item.latest || item);
         const reports = Number(item.reportsCount || item.reports || 0);
+        const events = Number(item.eventsCount || (item.events || []).length || 0);
         const uniqueVictims = Number(item.uniqueVictims || 0);
         const categories = Number(item.suspiciousCategories || this.suspiciousCategoryCount(item.events || [], reports, item.hardDetectionCount || 0));
         const softEsp = (item.events || [item]).filter(event => this.isSoftEspOrLosEvent(event)).length > 0;
         const strongAimSupport = (item.events || [item]).filter(event => this.hasStrongAimAngle(event) || this.isAimLockLikeEvent(event)).length;
         const text = this.eventText(item);
+        const highFalsePositiveRisk = String(item.falsePositiveRisk || '').toLowerCase().indexOf('high') !== -1;
+        const sniperLike = /barrett|cheytac|intervention|m21|wa2000|dragunov|m40a3|sniper/.test(String(item.weapon || item.weaponReference || item.cheatType || text || '').toLowerCase());
         const aimLockEvidenceCount = (item.events || [item]).filter(event => {
             const eventText = this.eventText(event);
             return this.isAimLockLikeEvent(event) &&
@@ -3591,31 +3663,57 @@ const plugin = {
             categories >= 2 ||
             strongAimSupport >= 2;
 
-        if (hard && (risk >= 80 || confidence >= 75)) {
+        if (hard && risk >= 80 && confidence >= 80) {
             return 'High Priority';
         }
 
-        if (!softEsp && (risk >= 85 || (risk >= 70 && confidence >= 70))) {
+        if (hard && risk >= 90 && confidence >= 70) {
             return 'High Priority';
         }
 
-        if (aimLockPattern && risk >= 75 && confidence >= 65 && (aimLockEvidenceCount >= 2 || reports > 0 || strongSingleAimLock)) {
+        if (!softEsp && !highFalsePositiveRisk && risk >= 90 && confidence >= 75 && independentlySupported) {
             return 'High Priority';
         }
 
-        if (softEsp && independentlySupported && risk >= 85 && confidence >= 55) {
+        if (aimLockPattern && !highFalsePositiveRisk && risk >= 80 && confidence >= 70 && (aimLockEvidenceCount >= 2 || reports > 0 || (strongSingleAimLock && risk >= 88 && confidence >= 78))) {
             return 'High Priority';
         }
 
-        if (risk >= 70 && confidence >= 45) {
+        if (softEsp && !highFalsePositiveRisk && independentlySupported && risk >= 90 && confidence >= 65 && (reports > 0 || uniqueVictims >= 2 || strongAimSupport >= 2 || categories >= 3)) {
+            if (sniperLike && reports === 0 && (events < 3 || uniqueVictims < 2)) {
+                return 'Needs Review';
+            }
+            return 'High Priority';
+        }
+
+        if (risk >= 75 && confidence >= 55) {
             return 'Needs Review';
         }
 
-        if (reports > 0 && risk >= 45) {
+        if (reports > 0 && risk >= 55 && confidence >= 40) {
             return 'Needs Review';
         }
 
-        return 'Watching';
+        return 'Monitoring';
+    },
+
+    statusBadge: function (item, status) {
+        const label = status || this.caseStatus(item);
+        const title = this.statusTooltip(item, label);
+        return `<span class="${this.badgeClass(label)}" title="${this.escape(title)}">${this.escape(label)}</span>`;
+    },
+
+    statusTooltip: function (item, status) {
+        if (status === 'Monitoring') {
+            return 'This player is actively being watched by the anticheat for further suspicion.';
+        }
+
+        if (status === 'Watching') {
+            const admin = this.clean(item && (item.watchedBy || item.watch && item.watch.lastRequestedBy), 'An admin');
+            return `${admin} has marked this user as watching.`;
+        }
+
+        return status || '';
     },
 
     statusClass: function (status) {
@@ -3781,10 +3879,6 @@ const plugin = {
     },
 
     adminInterpretation: function (item, hard, discord, action, evidenceType) {
-        if (item && item.interpretation) {
-            return item.interpretation;
-        }
-
         const risk = this.riskInfo(item).score;
         const confidence = this.confidenceInfo(item).score;
         const reports = Number(item && item.reports || 0);
@@ -3803,7 +3897,11 @@ const plugin = {
         }
 
         if (String(item && item.cheatType || '').toLowerCase().indexOf('esp') !== -1 || String(item && item.lineOfSight || '').toLowerCase().indexOf('poor') !== -1) {
-            return 'This is a soft ESP or line-of-sight suspicion event. Treat it as supporting evidence, not proof, unless repeated patterns or player reports exist.';
+            return 'Treat this as supporting evidence, not proof, unless repeated patterns or reports exist.';
+        }
+
+        if (item && item.interpretation) {
+            return item.interpretation;
         }
 
         if (reports > 0 && risk >= 45) {
@@ -4355,6 +4453,97 @@ const plugin = {
         ].join('\n');
 
         io.File.AppendAllText(path, `${block}\n`);
+    },
+
+    buildPlayerReportEvent: function (commandEvent, target, reporter, server, text) {
+        const host = this.stripColors(server.hostname || server.Hostname || server.serverName || server.ServerName || server.id || 'Unknown server');
+        const map = this.clean(server.mapName || server.MapName || server.currentMap || server.CurrentMap || server.map || server.Map || 'Unknown');
+        const targetGuid = this.clientGuid(target);
+        const reporterGuid = this.clientGuid(reporter);
+        const reason = this.reportReasonText(text);
+
+        return {
+            time: new Date().toISOString(),
+            kind: 'PLAYER_REPORT',
+            player: this.playerName(target),
+            guid: targetGuid || 'Unknown',
+            client: this.clientSlot(target),
+            profileId: this.clean(target.clientId || target.ClientId || this.profileIdFromMap(targetGuid) || 'Unknown'),
+            server: host,
+            serverKey: this.clean(server.id || server.Id || host),
+            map: map,
+            reporterName: this.playerName(reporter),
+            reporterGuid: reporterGuid || 'Unknown',
+            reporterClient: this.clientSlot(reporter),
+            reason: reason || 'No reason supplied',
+            rawCommand: this.clean(text || 'report')
+        };
+    },
+
+    appendPlayerReportLog: function (event) {
+        const io = importNamespace('System.IO');
+        const path = String(this.settings.logPath || '/app/Logs/anti-cheat-combined.log');
+        const directory = io.Path.GetDirectoryName(path);
+
+        if (directory && !io.Directory.Exists(directory)) {
+            io.Directory.CreateDirectory(directory);
+        }
+
+        const block = [
+            '============================================================',
+            `[${event.time}] ${event.kind} | ${event.serverKey || 'IW4MAdmin'}`,
+            `Player: ${event.player || 'Unknown'} | GUID: ${event.guid || 'Unknown'} | Client: ${event.client || '?'}`,
+            `Profile: ${event.profileId || 'Unknown'}`,
+            `Server: ${event.server || 'Unknown'}`,
+            `Map: ${event.map || 'Unknown'}`,
+            'Suspicion: 30 | Probability: Low | Type: Player Report',
+            'Evidence Quality: player report only | false-positive risk=High',
+            `Reporter: ${event.reporterName || 'Unknown'} | GUID: ${event.reporterGuid || 'Unknown'}`,
+            `Reason: ${event.reason || 'No reason supplied'}`,
+            'What looked suspicious:',
+            '  - Successful IW4MAdmin !report command was submitted for this player',
+            `  - Report reason: ${event.reason || 'No reason supplied'}`,
+            ''
+        ].join('\n');
+
+        io.File.AppendAllText(path, `${block}\n`);
+    },
+
+    reportReasonText: function (text) {
+        const raw = this.clean(text || '');
+        if (!raw) {
+            return '';
+        }
+
+        return raw.replace(/^!?report\b\s*/i, '').trim() || raw;
+    },
+
+    commandTargetClient: function (event) {
+        if (!event) {
+            return null;
+        }
+
+        return event.target ||
+            event.Target ||
+            event.targetClient ||
+            event.TargetClient ||
+            event.targetEntity ||
+            event.TargetEntity ||
+            null;
+    },
+
+    serverFromEvent: function (event, client) {
+        return (event && (event.server || event.Server)) ||
+            (client && (client.currentServer || client.CurrentServer)) ||
+            {};
+    },
+
+    clientGuid: function (client) {
+        return this.clean(client && (client.networkId || client.NetworkId || client.guid || client.GUID || client.xuid || client.Xuid || ''));
+    },
+
+    clientSlot: function (client) {
+        return this.clean(client && (client.clientNumber || client.ClientNumber || client.clientSlot || client.ClientSlot || client.clientId || client.ClientId || '?'), '?');
     },
 
     sendAutomatedBanDiscord: function (event) {
