@@ -238,7 +238,7 @@ If the worker is not installed, Watch still works locally, but IW4MAdmin flaggin
 ## Automatic Updates
 
 Stable updates are distributed through GitHub Releases. The updater checks the
-latest release every six hours through a `systemd` timer, verifies the release
+latest release every two hours through a `systemd` timer, verifies the release
 SHA-256 checksum, backs up every replaced file, and uses atomic file
 replacement. It does not require an active SSH session.
 
