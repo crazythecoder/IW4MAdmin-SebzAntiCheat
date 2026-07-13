@@ -26,6 +26,9 @@ Radar context is handled carefully:
 - Counter-UAV or EMP blocks the UAV/radar explanation.
 - Unsuppressed victim weapon fire can reduce suspicion only when the attacker's radar is not blocked.
 - Heartbeat sensor only explains hidden-target reads if the victim does **not** have Ninja (`specialty_heartbreaker`).
+- A single long-range sniper hidden-target read is reduced because common lanes,
+  wallbangs, and normal pre-aiming can look suspicious server-side. Repeated
+  sniper patterns still matter.
 
 ## Files
 
@@ -164,8 +167,36 @@ It groups events into player cases and separates:
 
 - Risk: how suspicious the behavior looks
 - Confidence: how reliable the evidence is
-- Reports: linked reports if report events are present in the anti-cheat log
-- Actions: Watch, Clear, Send Review
+- Reports: successful IW4MAdmin `!report` commands linked to the reported player
+- Actions: Watch/Undo Watch, Clear, Purge/Recover, Send Review
+
+Purging starts a five-day recovery window. Purged cases remain available under
+the `Purged` filter with a `Recover` action until permanent cleanup is due; the
+evidence is not immediately destroyed.
+
+The dashboard is a review queue, not a raw event dump. Weak evidence stays in
+the combined anti-cheat log so it can build a pattern later, but it does not
+appear in the panel by itself. Uncertain but meaningful evidence can appear as
+`Watching`; stronger repeated/corroborated evidence becomes `Needs Review`.
+
+Visible dashboard cases generally require at least one of:
+
+- IW4MAdmin hard anti-cheat detection
+- player report support
+- moderation/action history
+- Discord review eligibility
+- risk `>= 60` and confidence `>= 45`
+- repeated suspicious telemetry with medium confidence across multiple events,
+  victims, or signal types
+
+This is intentional. It keeps the panel from filling with low-confidence trace
+quirks, lucky wallbangs, normal pre-aims, and other weak signals.
+
+The IW4MAdmin plugin listens for successful `ClientCommandExecuted` report
+commands. When a player runs `!report <player> <reason>` and IW4MAdmin accepts
+the command, the plugin writes a normalized `PLAYER_REPORT` event into
+`Logs/anti-cheat-combined.log`. Failed/invalid report attempts should not become
+anti-cheat evidence because they do not reach the successful command event.
 
 If duplicate cases appear where one says `GUID Unknown` and another has a real
 GUID, restart IW4MAdmin and make sure the client map helper/watcher is running.
@@ -204,6 +235,81 @@ sudo systemctl enable --now anticheat-iw4m-flag-worker
 
 If the worker is not installed, Watch still works locally, but IW4MAdmin flagging may not be available.
 
+## Automatic Updates
+
+Stable updates are distributed through GitHub Releases. The updater checks the
+latest release every six hours through a `systemd` timer, verifies the release
+SHA-256 checksum, backs up every replaced file, and uses atomic file
+replacement. It does not require an active SSH session.
+
+The default example configuration automatically applies updater, dashboard,
+and helper updates. GSC updates are left pending by default because activating
+them needs an IW4X map rotation or server restart and may disconnect players.
+
+### Install the updater
+
+From a downloaded release or repository checkout:
+
+```bash
+sudo ./updater/install-updater.sh
+sudo nano /etc/iw4x-anticheat-updater.json
+```
+
+Set every `destination` to the corresponding file on the host. Add one pair of
+GSC destinations for each IW4X server. Configure restart commands as JSON
+argument arrays, without shell syntax. Examples:
+
+```json
+"restartCommands": {
+  "dashboard": [["docker", "restart", "iw4madmin"]],
+  "helpers": [["systemctl", "restart", "anticheat-discord-watcher"]],
+  "gsc": [["systemctl", "restart", "iw4x-server"]]
+}
+```
+
+Test the configuration before enabling automatic checks:
+
+```bash
+sudo /opt/iw4x-anticheat-updater/anticheat-updater.py --check
+sudo systemctl enable --now iw4x-anticheat-updater.timer
+systemctl list-timers iw4x-anticheat-updater.timer
+```
+
+Useful commands:
+
+```bash
+# Install components enabled under autoApply
+sudo systemctl start iw4x-anticheat-updater.service
+
+# Install every component, including staged GSC updates
+sudo /opt/iw4x-anticheat-updater/anticheat-updater.py --apply-all
+
+# Restore the most recent pre-update backup
+sudo /opt/iw4x-anticheat-updater/anticheat-updater.py --rollback
+
+# Inspect the last updater run
+journalctl -u iw4x-anticheat-updater.service -n 100 --no-pager
+```
+
+Local webhook configuration, databases, logs, and server configuration are not
+release targets and are never overwritten. For a private GitHub repository,
+provide a read-only `GITHUB_TOKEN` through a systemd environment file. A token
+is not needed while the repository is public.
+
+### Publish an update
+
+Update `VERSION`, commit the tested files, and push a matching version tag:
+
+```bash
+git tag v1.0.0
+git push origin main v1.0.0
+```
+
+The GitHub Actions release workflow builds
+`iw4x-anticheat-release.zip`, generates its checksum, and publishes both files
+to the matching GitHub Release. Installed updaters then discover it on their
+next scheduled check.
+
 ## Testing
 
 For bot testing:
@@ -225,6 +331,7 @@ Repeatedly held crosshair on hidden targets before killing them
 Aimed at this target through a wall before killing them
 ADS aim stayed tightly locked on the victim after a sudden correction
 Victim had Ninja, so heartbeat sensor did not explain the hidden-target push
+Single long-range sniper hidden-target read; confidence reduced until repeated
 ```
 
 ## Interpreting Evidence

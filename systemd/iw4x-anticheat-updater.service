@@ -1,0 +1,11 @@
+[Unit]
+Description=Check and apply stable IW4X anti-cheat updates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/iw4x-anticheat-updater/anticheat-updater.py --config /etc/iw4x-anticheat-updater.json
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0027

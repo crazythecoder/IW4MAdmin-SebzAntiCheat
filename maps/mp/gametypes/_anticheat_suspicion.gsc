@@ -738,6 +738,16 @@ acs_processKill(victim, weapon, meansOfDeath, hitLoc)
         reasons = acs_addReason(reasons, "Victim recently fired an unsuppressed weapon and radar was not blocked; confidence reduced");
     }
 
+    if (isSniperKill && distance > 1200 && (preAimSignal || hiddenCrosshairSignal || hiddenPursuitSignal) && self.acs_recent_hidden_crosshair_kills <= 1 && self.acs_recent_sniper_suspicious_events <= 0 && !scriptedLockSignal && !adsLockSignal)
+    {
+        // Long sniper lanes and common wallbang/pre-aim spots can look like ESP
+        // from server-side traces. Keep the event as evidence, but do not let a
+        // single sniper read become an immediate Discord/staff alert.
+        strongScore = int(strongScore * 0.45);
+        weakScore = int(weakScore * 0.75);
+        reasons = acs_addReason(reasons, "Single long-range sniper hidden-target read; confidence reduced until repeated");
+    }
+
     if (!hasLos && distance > 300)
     {
         if (preAimSignal || hiddenCrosshairSignal || hiddenPursuitSignal)

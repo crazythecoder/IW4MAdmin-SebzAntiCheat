@@ -1,0 +1,56 @@
+{
+  "repository": "crazythecoder/IW4MAdmin-SebzAntiCheat",
+  "stateFile": "/var/lib/iw4x-anticheat-updater/state.json",
+  "backupDirectory": "/var/lib/iw4x-anticheat-updater/backups",
+  "autoApply": {
+    "updater": true,
+    "dashboard": true,
+    "helpers": true,
+    "gsc": false
+  },
+  "targets": {
+    "updater": [
+      {
+        "source": "updater/anticheat-updater.py",
+        "destination": "/opt/iw4x-anticheat-updater/anticheat-updater.py"
+      }
+    ],
+    "dashboard": [
+      {
+        "source": "iw4madmin/Plugins/AnticheatMetrics.js",
+        "destination": "/path/to/IW4MAdmin/Plugins/AnticheatMetrics.js"
+      }
+    ],
+    "helpers": [
+      {
+        "source": "anticheat-discord-watcher.js",
+        "destination": "/opt/iw4x-anticheat/anticheat-discord-watcher.js"
+      },
+      {
+        "source": "iw4m-client-map.py",
+        "destination": "/opt/iw4x-anticheat/iw4m-client-map.py"
+      },
+      {
+        "source": "iw4madmin/Plugins/anticheat_iw4m_flag_worker.py",
+        "destination": "/path/to/IW4MAdmin/Plugins/anticheat_iw4m_flag_worker.py"
+      }
+    ],
+    "gsc": [
+      {
+        "source": "maps/mp/gametypes/_anticheat_suspicion.gsc",
+        "destination": "/path/to/server/userraw/maps/mp/gametypes/_anticheat_suspicion.gsc"
+      },
+      {
+        "source": "maps/mp/gametypes/_killstreak_logger.gsc",
+        "destination": "/path/to/server/userraw/maps/mp/gametypes/_killstreak_logger.gsc"
+      }
+    ]
+  },
+  "restartCommands": {
+    "updater": [],
+    "dashboard": [],
+    "helpers": [],
+    "gsc": []
+  },
+  "healthCheckCommands": []
+}
