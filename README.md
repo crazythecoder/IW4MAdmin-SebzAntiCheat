@@ -324,6 +324,9 @@ next scheduled check.
 The bottom of the IW4MAdmin **Anticheat** page shows operational status for the
 dashboard plugin, Discord/log watcher, evidence storage, client profile map,
 and each configured server's anti-cheat and killstreak GSC scripts.
+The System Status header and Dashboard Plugin check display the version loaded
+by IW4MAdmin, which may differ from GitHub's latest release until an update is
+installed and IW4MAdmin restarts.
 
 The existing Node watcher verifies each configured GSC file, its `custom.gsc`
 hook, the current IW4X console state, and later gameplay activity. It writes the result to

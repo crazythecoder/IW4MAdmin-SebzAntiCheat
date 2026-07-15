@@ -9,7 +9,7 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
 
 const plugin = {
     author: 'Local',
-    version: '1.0.0',
+    version: '1.0.3',
     name: 'Anticheat Metrics',
     logger: null,
     config: null,
@@ -73,7 +73,7 @@ const plugin = {
         const interactionRegistration = serviceResolver.resolveService('IInteractionRegistration');
         interactionRegistration.unregisterInteraction(anticheatNavKey);
 
-        this.logger.logInformation('{Name} loaded. LogPath={LogPath}', this.name, this.settings.logPath);
+        this.logger.logInformation('{Name} v{Version} loaded. LogPath={LogPath}', this.name, this.version, this.settings.logPath);
         this.recentReportEvents = {};
         this.finalizeExpiredPurges();
     },
@@ -741,10 +741,13 @@ const plugin = {
                         <h2 class="ac-section-title">System Status</h2>
                         <p class="ac-section-subtitle">Operational checks from script load markers, activity, and helper output.</p>
                     </div>
-                    <span class="ac-system-overall ${overallClass}">${this.escape(overallLabel)}</span>
+                    <div class="ac-system-heading-meta">
+                        <span class="ac-system-version"><i class="ph ph-tag"></i> v${this.escape(this.version)}</span>
+                        <span class="ac-system-overall ${overallClass}">${this.escape(overallLabel)}</span>
+                    </div>
                 </div>
                 <div class="ac-system-core">
-                    ${this.healthCell('Dashboard plugin', { state: 'good', label: 'Operational', detail: 'This page was rendered by the active IW4MAdmin plugin.' })}
+                    ${this.healthCell('Dashboard plugin', { state: 'good', label: `v${this.version} loaded`, detail: `This page was rendered by Anticheat Metrics v${this.version}.` })}
                     ${this.healthCell('Log watcher', health.watcher)}
                     ${this.healthCell('Evidence storage', health.evidence)}
                     ${this.healthCell('Client profile map', health.clientMap)}
@@ -2086,6 +2089,27 @@ const plugin = {
                     justify-content: space-between;
                     gap: 18px;
                     margin-bottom: 18px;
+                }
+                #anticheat-metrics-panel .ac-system-heading-meta {
+                    display: flex;
+                    align-items: center;
+                    justify-content: flex-end;
+                    gap: 8px;
+                    flex-wrap: wrap;
+                }
+                #anticheat-metrics-panel .ac-system-version {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 5px;
+                    min-height: 28px;
+                    padding: 4px 9px;
+                    border: 1px solid rgba(112,153,209,.2);
+                    border-radius: 999px;
+                    background: rgba(112,153,209,.06);
+                    color: #a9c3e5;
+                    font-size: 11px;
+                    font-weight: 600;
+                    white-space: nowrap;
                 }
                 #anticheat-metrics-panel .ac-system-overall {
                     display: inline-flex;
