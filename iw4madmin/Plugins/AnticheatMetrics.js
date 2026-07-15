@@ -2986,7 +2986,7 @@ const plugin = {
     },
 
     watchKey: function (item) {
-        const guid = this.clean(item.guid || item.playerGuid || '').toLowerCase();
+        const guid = this.identityValue(item.guid || item.playerGuid || '');
         if (guid) {
             return `guid:${guid}`;
         }
@@ -3003,21 +3003,32 @@ const plugin = {
         const guidAliases = {};
 
         normalizedItems.forEach(item => {
-            if (this.clean(item.playerGuid || item.guid || '').toLowerCase()) {
+            const guid = this.identityValue(item.playerGuid || item.guid || '');
+            if (guid) {
                 this.caseAliasKeys(item).forEach(alias => {
-                    guidAliases[alias] = item.caseId;
+                    if (!Object.prototype.hasOwnProperty.call(guidAliases, alias)) {
+                        guidAliases[alias] = item.caseId;
+                    } else if (guidAliases[alias] !== item.caseId) {
+                        // Never merge a fallback identity when an alias matches multiple real GUIDs.
+                        guidAliases[alias] = '';
+                    }
                 });
             }
         });
 
         normalizedItems.forEach(item => {
-            const hasGuid = !!this.clean(item.playerGuid || item.guid || '').toLowerCase();
+            const hasGuid = !!this.identityValue(item.playerGuid || item.guid || '');
             const aliasCaseId = !hasGuid ? this.firstAliasCaseId(item, guidAliases) : '';
             if (aliasCaseId) {
                 item.caseId = aliasCaseId;
+                if (aliasCaseId.indexOf('guid:') === 0) {
+                    item.playerGuid = aliasCaseId.substring(5);
+                    item.guid = item.playerGuid;
+                }
             }
         });
 
+        normalizedItems = this.deduplicateReportEvents(normalizedItems);
         normalizedItems = this.promoteTimelineEvidence(normalizedItems);
 
         normalizedItems.forEach(item => {
@@ -3405,11 +3416,11 @@ const plugin = {
     caseAliasKeys: function (item) {
         const player = this.normalizedPlayerName(item.playerName || item.player || '');
         const server = this.clean(item.serverName || item.server || item.serverKey || '').toLowerCase();
-        const client = this.clean(item.clientId || item.client || '').toLowerCase();
-        const profile = this.clean(item.profileId || '').toLowerCase();
+        const client = this.identityValue(item.clientId || item.client || '');
+        const profile = this.identityValue(item.profileId || '');
         const keys = [];
 
-        if (player && server && client && client !== 'unknown') {
+        if (player && server && client) {
             keys.push(`player-server-client:${player}|${server}|${client}`);
         }
         if (player && server) {
@@ -3432,12 +3443,48 @@ const plugin = {
         return '';
     },
 
+    deduplicateReportEvents: function (events) {
+        const retained = [];
+        const recent = {};
+        const duplicateWindowMs = 30000;
+
+        (events || []).forEach(event => {
+            if (event.eventType !== 'player_report' && !this.itemLooksLikeReport(event)) {
+                retained.push(event);
+                return;
+            }
+
+            const at = Date.parse(event.timestamp || event.time || '') || 0;
+            const reporter = this.identityValue(event.reporterGuid || '') ||
+                this.normalizedPlayerName(event.reporterName || event.reporter || 'unknown');
+            const reasons = event.rawReasons || event.reasons || [];
+            const reason = this.clean(event.reason || reasons[0] || '').toLowerCase();
+            const key = [event.caseId, reporter, reason].join('|');
+            const prior = recent[key];
+
+            if (prior && at > 0 && prior.at > 0 && Math.abs(at - prior.at) <= duplicateWindowMs) {
+                const currentGuid = this.identityValue(event.playerGuid || event.guid || '');
+                const priorGuid = this.identityValue(prior.event.playerGuid || prior.event.guid || '');
+                if (currentGuid && !priorGuid) {
+                    retained[prior.index] = event;
+                    recent[key] = { at: at, event: event, index: prior.index };
+                }
+                return;
+            }
+
+            recent[key] = { at: at, event: event, index: retained.length };
+            retained.push(event);
+        });
+
+        return retained;
+    },
+
     normalizeEvent: function (item, index) {
         const normalized = Object.assign({}, item || {});
         normalized.timestamp = item.time || item.timestamp || new Date().toISOString();
         normalized.displayTime = item.displayTime || this.formatDisplayTime(normalized.timestamp);
         normalized.playerName = item.playerName || item.player || 'Unknown';
-        normalized.playerGuid = item.playerGuid || item.guid || '';
+        normalized.playerGuid = this.identityValue(item.playerGuid || item.guid || '');
         normalized.clientId = item.clientId || item.client || 'Unknown';
         normalized.serverName = item.serverName || item.server || item.serverKey || 'Unknown server';
         normalized.serverKey = item.serverKey || normalized.serverName;
@@ -4361,8 +4408,8 @@ const plugin = {
     },
 
     caseIdForEvent: function (item) {
-        const guid = this.clean(item.playerGuid || item.guid || '').toLowerCase();
-        if (guid && guid !== 'unknown') {
+        const guid = this.identityValue(item.playerGuid || item.guid || '');
+        if (guid) {
             return 'guid:' + guid;
         }
 
@@ -5726,6 +5773,16 @@ const plugin = {
 
     normalizedPlayerName: function (value) {
         return this.stripColors(value).toLowerCase().replace(/\s+/g, ' ').trim();
+    },
+
+    identityValue: function (value) {
+        const result = this.clean(value).toLowerCase();
+        if (!result || result === 'unknown' || result === 'unknown guid' || result === 'not available' ||
+            result === 'not recorded' || result === 'n/a' || result === 'null' || result === 'undefined' ||
+            result === '?' || result === '-') {
+            return '';
+        }
+        return result;
     },
 
     clean: function (value) {

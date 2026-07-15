@@ -201,6 +201,11 @@ offense. The plugin writes that data as a normalized `PLAYER_REPORT` event in
 penalty events and therefore do not become anti-cheat evidence. Identical
 target/reporter/reason events are deduplicated for 30 seconds.
 
+Legacy report records whose GUID is `Unknown` are merged into a matching
+resolved-GUID case when player/server/client or profile aliases identify one
+unambiguous player. If an alias could refer to multiple GUIDs, it is left
+separate rather than risking an incorrect merge.
+
 If duplicate cases appear where one says `GUID Unknown` and another has a real
 GUID, restart IW4MAdmin and make sure the client map helper/watcher is running.
 The plugin will merge fallback player/server/client cases into the real GUID
