@@ -2,7 +2,6 @@ const anticheatNavKey = 'Webfront::Nav::Admin::Anticheat';
 
 const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
     registerNotify('IManagementEventSubscriptions.ClientPenaltyAdministered', (penaltyEvent, token) => plugin.onPenalty(penaltyEvent, token));
-    registerNotify('IManagementEventSubscriptions.ClientCommandExecuted', (commandEvent, token) => plugin.onCommand(commandEvent, token));
 
     plugin.onLoad(serviceResolver, configWrapper, pluginHelper);
     return plugin;
@@ -16,9 +15,12 @@ const plugin = {
     config: null,
     helper: null,
     manager: null,
+    recentReportEvents: {},
     settings: {
         logPath: '/app/Logs/anti-cheat-combined.log',
-        maxItems: 75,
+        healthPath: '/app/Logs/anticheat-health.json',
+        healthStaleSeconds: 420,
+        maxItems: 300,
         sendDiscordForAutomatedBans: true,
         webhookUrl: '',
         cwsSettingsPath: '/app/Configuration/cws/Settings.json',
@@ -29,7 +31,12 @@ const plugin = {
         iw4mFlagPenaltyType: 2,
         iw4mFlagPunisherId: 1,
         dashboardBaseUrl: '',
-        mention: '@here'
+        mention: '@here',
+        candidateWindowMinutes: 15,
+        candidateMinSimilarEvents: 3,
+        candidateMinRisk: 65,
+        candidateMinConfidence: 55,
+        purgeRetentionDays: 5
     },
 
     commands: [{
@@ -67,6 +74,8 @@ const plugin = {
         interactionRegistration.unregisterInteraction(anticheatNavKey);
 
         this.logger.logInformation('{Name} loaded. LogPath={LogPath}', this.name, this.settings.logPath);
+        this.recentReportEvents = {};
+        this.finalizeExpiredPurges();
     },
 
     onPenalty: function (penaltyEvent, _) {
@@ -78,6 +87,11 @@ const plugin = {
         }
 
         const type = this.clean(penalty.type || penalty.Type || '');
+        if (type.toLowerCase() === 'report') {
+            this.onPlayerReportPenalty(penaltyEvent, penalty, client);
+            return;
+        }
+
         if (type !== 'Ban' && type !== 'TempBan') {
             return;
         }
@@ -95,28 +109,29 @@ const plugin = {
         }
     },
 
-    onCommand: function (commandEvent, _) {
-        const text = String(commandEvent && (commandEvent.commandText || commandEvent.CommandText || commandEvent.data || commandEvent.Data) || '');
-        const commandName = commandEvent && commandEvent.command && commandEvent.command.name
-            ? String(commandEvent.command.name)
-            : (commandEvent && commandEvent.Command && commandEvent.Command.Name ? String(commandEvent.Command.Name) : '');
+    onPlayerReportPenalty: function (penaltyEvent, penalty, target) {
+        const reporter = penalty.punisher || penalty.Punisher || penalty.admin || penalty.Admin ||
+            penaltyEvent.origin || penaltyEvent.Origin || null;
+        const server = this.serverFromEvent(penaltyEvent, target);
+        const event = this.buildPlayerReportPenaltyEvent(penaltyEvent, penalty, target, reporter, server);
+        const duplicateKey = this.playerReportDedupeKey(event);
+        const now = Date.now();
+        const duplicateWindowMs = 30000;
 
-        if (!/^!?report\b/i.test(text) && !/^report$/i.test(commandName)) {
+        Object.keys(this.recentReportEvents).forEach(key => {
+            if (now - Number(this.recentReportEvents[key] || 0) > duplicateWindowMs) {
+                delete this.recentReportEvents[key];
+            }
+        });
+
+        if (this.recentReportEvents[duplicateKey] && now - this.recentReportEvents[duplicateKey] <= duplicateWindowMs) {
+            this.logger.logInformation('{Name} ignored duplicate IW4MAdmin report event. Reporter={Reporter}, Target={Target}', this.name, event.reporterName, event.player);
             return;
         }
 
-        const target = this.commandTargetClient(commandEvent);
-        const reporter = commandEvent.origin || commandEvent.Origin || commandEvent.client || commandEvent.Client || null;
-
-        if (!target || !reporter) {
-            this.logger.logWarning('{Name} saw a report command but could not resolve reporter/target', this.name);
-            return;
-        }
-
-        const server = this.serverFromEvent(commandEvent, target);
-        const event = this.buildPlayerReportEvent(commandEvent, target, reporter, server, text || commandName);
+        this.recentReportEvents[duplicateKey] = now;
         this.appendPlayerReportLog(event);
-        this.logger.logInformation('{Name} linked IW4MAdmin report to anti-cheat queue. Reporter={Reporter}, Target={Target}, Reason={Reason}', this.name, event.reporterName, event.player, event.reason);
+        this.logger.logInformation('{Name} linked successful IW4MAdmin report to anti-cheat queue. Reporter={Reporter}, Target={Target}, Reason={Reason}', this.name, event.reporterName, event.player, event.reason);
     },
 
     buildInteraction: function () {
@@ -139,13 +154,21 @@ const plugin = {
     },
 
     renderPage: function (meta, originId) {
+        this.finalizeExpiredPurges();
         const actionResult = this.handleDashboardAction(meta, originId);
         const items = this.readEvents();
         const cases = this.buildCases(items);
+        const purgedCases = this.recoverablePurgedCases();
+        const queueCases = cases.concat(purgedCases);
         const stats = this.dashboardStats(cases, items);
+        const systemHealth = this.readSystemHealth();
         const openCaseId = this.clean(this.metaValue(meta, 'acCase'), '');
 
         if (openCaseId) {
+            const pendingPurge = this.pendingPurgeForCase(openCaseId);
+            if (pendingPurge) {
+                return this.renderPurgedCaseProfile(pendingPurge, actionResult);
+            }
             return this.renderCaseProfile(openCaseId, cases, actionResult);
         }
 
@@ -179,7 +202,7 @@ const plugin = {
                     <div class="ac-toolbar">
                         <div>
                             <h2 class="ac-section-title">Review Queue</h2>
-                            <p class="ac-section-subtitle">${cases.length} ${cases.length === 1 ? 'case' : 'cases'} grouped by player, server, and GUID.</p>
+                            <p class="ac-section-subtitle">${cases.length} active ${cases.length === 1 ? 'case' : 'cases'} grouped by player, server, and GUID.${purgedCases.length ? ` ${purgedCases.length} recoverable ${purgedCases.length === 1 ? 'purge' : 'purges'}.` : ''}</p>
                         </div>
                         <div class="ac-controls">
                             <label class="ac-control">
@@ -190,6 +213,7 @@ const plugin = {
                                         <option value="high-priority">High Priority</option>
                                         <option value="monitoring">Monitoring</option>
                                         <option value="watching">Watching</option>
+                                        <option value="purged">Purged</option>
                                         <option value="hard">Hard Detections</option>
                                         <option value="soft">Soft Suspicion</option>
                                         <option value="reports">Reports</option>
@@ -211,7 +235,7 @@ const plugin = {
                         </div>
                     </div>`;
 
-        if (cases.length === 0) {
+        if (queueCases.length === 0) {
             html += `
                 <div class="ac-empty">
                     <i class="ph ph-shield-check"></i>
@@ -220,14 +244,15 @@ const plugin = {
                 </div>`;
         } else {
             html += '<div id="ac-case-list" class="ac-case-list">';
-            cases.forEach(item => {
-                html += this.caseCard(item);
+            queueCases.forEach(item => {
+                html += item.status === 'Purged' ? this.purgedCaseCard(item) : this.caseCard(item);
             });
             html += '</div>';
         }
 
         html += `
                 </section>
+                ${this.systemHealthPanel(systemHealth)}
             </div>
             <script>
                 (() => {
@@ -328,15 +353,16 @@ const plugin = {
                             const kind = card.getAttribute('data-kind') || '';
                             const reports = Number(card.getAttribute('data-reports') || '0');
                             const hard = card.getAttribute('data-hard') === 'true';
-                            let visible = true;
+                            let visible = status !== 'Purged';
 
                             if (filter.value === 'needs-review') visible = status === 'Needs Review';
                             else if (filter.value === 'high-priority') visible = status === 'High Priority';
                             else if (filter.value === 'monitoring') visible = status === 'Monitoring';
                             else if (filter.value === 'watching') visible = status === 'Watching';
-                            else if (filter.value === 'hard') visible = hard;
-                            else if (filter.value === 'soft') visible = !hard && kind !== 'AUTO_BAN' && kind !== 'AUTO_TEMPBAN';
-                            else if (filter.value === 'reports') visible = reports > 0;
+                            else if (filter.value === 'purged') visible = status === 'Purged';
+                            else if (filter.value === 'hard') visible = status !== 'Purged' && hard;
+                            else if (filter.value === 'soft') visible = status !== 'Purged' && !hard && kind !== 'AUTO_BAN' && kind !== 'AUTO_TEMPBAN';
+                            else if (filter.value === 'reports') visible = status !== 'Purged' && reports > 0;
 
                             card.style.display = visible ? '' : 'none';
                             if (visible) {
@@ -422,6 +448,9 @@ const plugin = {
                         document.querySelectorAll('#anticheat-metrics-panel button[data-ac-review]').forEach(button => {
                             button.addEventListener('click', () => runCaseAction(button, 'send-review'));
                         });
+                        document.querySelectorAll('#anticheat-metrics-panel button[data-ac-recover]').forEach(button => {
+                            button.addEventListener('click', () => runCaseAction(button, 'undo-purge'));
+                        });
                         document.querySelectorAll('#anticheat-metrics-panel button[data-ac-open]').forEach(button => {
                             button.addEventListener('click', () => {
                                 const caseId = button.getAttribute('data-case-id') || '';
@@ -455,10 +484,16 @@ const plugin = {
                         if (action === 'send-review' && !window.confirm('Send this case to the Discord staff review webhook?')) {
                             return;
                         }
+                        if (action === 'undo-purge' && !window.confirm('Recover this case and restore its evidence to the anti-cheat review queue?')) {
+                            return;
+                        }
 
                         const previous = button.textContent;
                         button.disabled = true;
-                        button.textContent = action === 'watch' ? 'Watching...' : (action === 'unwatch' ? 'Removing...' : (action === 'clear' ? 'Clearing...' : 'Sending...'));
+                        button.textContent = action === 'watch' ? 'Watching...'
+                            : (action === 'unwatch' ? 'Removing...'
+                            : (action === 'clear' ? 'Clearing...'
+                            : (action === 'undo-purge' ? 'Recovering...' : 'Sending...')));
 
                         const stateBefore = captureState();
                         fetch(actionUrl({ acAction: action, caseId: caseId }), { cache: 'no-store', credentials: 'same-origin' })
@@ -561,6 +596,171 @@ const plugin = {
                 <div class="ac-stat-label">${this.escape(label)}</div>
                 <div class="ac-stat-value">${this.escape(value)}</div>
                 <div class="ac-stat-desc">${this.escape(subtitle || '')}</div>
+            </div>`;
+    },
+
+    readSystemHealth: function () {
+        const io = importNamespace('System.IO');
+        const healthPath = String(this.settings.healthPath || '/app/Logs/anticheat-health.json');
+        const result = {
+            available: false,
+            generatedAt: '',
+            watcher: { state: 'waiting', label: 'Waiting for health data', detail: 'No watcher heartbeat has been received yet.' },
+            evidence: { state: 'waiting', label: 'Not initialized', detail: 'The combined evidence log has not been created yet.' },
+            clientMap: { state: 'optional', label: 'Not available', detail: 'Client profile linking is optional.' },
+            servers: []
+        };
+
+        const logPath = String(this.settings.logPath || '/app/Logs/anti-cheat-combined.log');
+        if (io.File.Exists(logPath)) {
+            result.evidence = { state: 'good', label: 'Ready', detail: 'Combined evidence storage is available.' };
+        }
+
+        const clientMapPath = String(this.settings.clientMapPath || '/app/Logs/iw4m-client-map.json');
+        if (io.File.Exists(clientMapPath)) {
+            result.clientMap = { state: 'good', label: 'Ready', detail: 'IW4MAdmin client profile mapping is available.' };
+        }
+
+        if (!io.File.Exists(healthPath)) {
+            return result;
+        }
+
+        try {
+            const health = JSON.parse(String(io.File.ReadAllText(healthPath)));
+            const now = Date.now();
+            const staleSeconds = Number(this.settings.healthStaleSeconds || 420);
+            const watcherAge = this.healthAgeSeconds(health.generatedAt, now);
+            result.available = true;
+            result.generatedAt = this.clean(health.generatedAt || '');
+            result.watcher = watcherAge <= 45
+                ? { state: 'good', label: 'Operational', detail: 'The log watcher is processing health updates.', time: health.generatedAt }
+                : (watcherAge <= 120
+                    ? { state: 'warning', label: 'Delayed', detail: `Last watcher update was ${watcherAge} seconds ago.`, time: health.generatedAt }
+                    : { state: 'bad', label: 'Unavailable', detail: 'The log watcher health file is stale.', time: health.generatedAt });
+
+            const servers = health.servers || {};
+            Object.keys(servers).sort().forEach(key => {
+                const server = servers[key] || {};
+                result.servers.push({
+                    name: this.clean(server.name || key),
+                    displayName: this.clean(server.hostName || (server.antiCheat && server.antiCheat.serverName) || (server.killstreakLogger && server.killstreakLogger.serverName) || server.name || key),
+                    map: this.clean((server.antiCheat && server.antiCheat.map) || (server.killstreakLogger && server.killstreakLogger.map) || ''),
+                    gameType: this.clean((server.antiCheat && server.antiCheat.gameType) || (server.killstreakLogger && server.killstreakLogger.gameType) || ''),
+                    log: this.gameLogHealthStatus(server),
+                    antiCheat: this.scriptHealthStatus(server.antiCheat, staleSeconds, now),
+                    killstreak: this.scriptHealthStatus(server.killstreakLogger, staleSeconds, now)
+                });
+            });
+        } catch (ex) {
+            result.watcher = { state: 'bad', label: 'Invalid health data', detail: this.clean(ex.message || ex.toString()) };
+        }
+
+        return result;
+    },
+
+    healthAgeSeconds: function (value, now) {
+        const timestamp = Date.parse(String(value || ''));
+        if (!timestamp) {
+            return 2147483647;
+        }
+        return Math.max(0, Math.floor(((now || Date.now()) - timestamp) / 1000));
+    },
+
+    gameLogHealthStatus: function (server) {
+        if (!server.logReadable) {
+            return { state: 'bad', label: 'Unavailable', detail: this.clean(server.logError || 'The configured game log cannot be read.'), time: server.lastLogCheckAt };
+        }
+        if (server.lifecycle && server.lifecycle.state === 'stopped') {
+            return { state: 'warning', label: 'Server stopped', detail: 'The game log is readable, but the latest lifecycle event was ShutdownGame.', time: server.lifecycle.changedAt };
+        }
+        if (server.lifecycle && server.lifecycle.state === 'loading') {
+            return { state: 'waiting', label: 'Loading', detail: 'The server started a new game and script verification is pending.', time: server.lifecycle.changedAt };
+        }
+        return { state: 'good', label: 'Readable', detail: 'The configured game log can be read.', time: server.lastLogCheckAt };
+    },
+
+    scriptHealthStatus: function (component, staleSeconds, now) {
+        const state = this.clean(component && component.state || '').toLowerCase();
+        if (state === 'missing') {
+            return { state: 'bad', label: 'Missing', detail: this.clean(component.detail || 'The script file is missing.') };
+        }
+        if (state === 'hook_missing') {
+            return { state: 'bad', label: 'Hook missing', detail: this.clean(component.detail || 'custom.gsc does not initialize this script.') };
+        }
+        if (state === 'failed') {
+            return { state: 'bad', label: 'Compile failed', detail: this.clean(component.detail || 'IW4X reported a script compile failure.') };
+        }
+
+        const lastSeenAt = component && component.lastSeenAt;
+        if (!lastSeenAt) {
+            return { state: 'waiting', label: 'Not confirmed', detail: 'Waiting for the script load marker.' };
+        }
+
+        const age = this.healthAgeSeconds(lastSeenAt, now);
+        const activity = component && component.lastActivityAt;
+        return {
+            state: 'good',
+            label: activity ? 'Operational' : 'Loaded',
+            detail: this.clean(component && component.detail || (activity
+                ? `The script loaded successfully and last produced activity ${this.healthAgeSeconds(activity, now)} seconds ago.`
+                : `The script was confirmed loaded ${age} seconds ago. No suspicious gameplay or killstreak activity is required for this check.`)),
+            time: activity || lastSeenAt
+        };
+    },
+
+    systemHealthPanel: function (health) {
+        const servers = health.servers || [];
+        const hasAttention = health.watcher.state === 'bad' || servers.some(server =>
+            server.log.state === 'bad' || server.log.state === 'warning' ||
+            server.antiCheat.state === 'bad' || server.antiCheat.state === 'warning' ||
+            server.killstreak.state === 'bad' || server.killstreak.state === 'warning');
+        const waiting = !health.available || servers.some(server => server.antiCheat.state === 'waiting' || server.killstreak.state === 'waiting');
+        const overallClass = hasAttention ? 'is-bad' : (waiting ? 'is-warning' : 'is-good');
+        const overallLabel = hasAttention ? 'Attention needed' : (waiting ? 'Verification pending' : 'All monitored components operational');
+
+        let serverRows = '';
+        if (!servers.length) {
+            serverRows = '<div class="ac-system-empty">No configured server health records yet. The watcher will add them after it starts.</div>';
+        } else {
+            serverRows = servers.map(server => `
+                <div class="ac-system-server">
+                    <div class="ac-system-server-name">
+                        <strong>${this.escape(this.stripColors(server.displayName || server.name))}</strong>
+                        <span>${this.escape([server.name, server.map, server.gameType].filter(Boolean).join(' · '))}</span>
+                    </div>
+                    ${this.healthCell('Game log', server.log)}
+                    ${this.healthCell('Anti-cheat GSC', server.antiCheat)}
+                    ${this.healthCell('Killstreak logger', server.killstreak)}
+                </div>`).join('');
+        }
+
+        return `
+            <section class="ac-system-status">
+                <div class="ac-system-heading">
+                    <div>
+                        <h2 class="ac-section-title">System Status</h2>
+                        <p class="ac-section-subtitle">Operational checks from script load markers, activity, and helper output.</p>
+                    </div>
+                    <span class="ac-system-overall ${overallClass}">${this.escape(overallLabel)}</span>
+                </div>
+                <div class="ac-system-core">
+                    ${this.healthCell('Dashboard plugin', { state: 'good', label: 'Operational', detail: 'This page was rendered by the active IW4MAdmin plugin.' })}
+                    ${this.healthCell('Log watcher', health.watcher)}
+                    ${this.healthCell('Evidence storage', health.evidence)}
+                    ${this.healthCell('Client profile map', health.clientMap)}
+                </div>
+                <div class="ac-system-servers">${serverRows}</div>
+                <p class="ac-system-note">A green check confirms the script loaded for the current game session. A gray clock means verification is still pending; it does not automatically mean the component failed.</p>
+            </section>`;
+    },
+
+    healthCell: function (label, status) {
+        const state = this.clean(status && status.state || 'waiting');
+        const icon = state === 'good' ? 'ph-check-circle' : (state === 'bad' ? 'ph-x-circle' : (state === 'warning' ? 'ph-warning-circle' : 'ph-clock'));
+        return `
+            <div class="ac-system-cell ac-system-${this.escape(state)}" title="${this.escape(status && status.detail || '')}">
+                <i class="ph ${icon}"></i>
+                <div><span>${this.escape(label)}</span><strong>${this.escape(status && status.label || 'Unknown')}</strong></div>
             </div>`;
     },
 
@@ -669,13 +869,67 @@ const plugin = {
                             <section class="ac-evidence-group">
                                 <div class="ac-section-label">Discord / Review Status</div>
                                 <div class="ac-evidence-grid">
-                                ${this.evidenceItem('Discord Status', discord.shortLabel)}
+                                <div class="ac-evidence-item"><strong>${this.escape(discord.shortLabel)}</strong></div>
                                 </div>
                                 ${discordNote ? `<p class="ac-evidence-note">${this.escape(discordNote)}</p>` : ''}
                             </section>
                         </div>
                         ${this.rawDebugDetails(item, rawReasons)}
                     </details>
+                </div>
+            </div>`;
+    },
+
+    purgedCaseCard: function (item) {
+        const caseKey = this.caseKey(item);
+        const risk = this.riskInfo(item);
+        const confidence = this.confidenceInfo(item);
+        const reports = Number(item.reportsCount || item.reports || 0);
+        const events = Number(item.eventsCount || (item.events || []).length);
+        const timeValue = Date.parse(item.purgedAt || item.time || '') || 0;
+
+        return `
+            <div data-ac-case="true"
+                 data-case-key="${this.escape(caseKey)}"
+                 data-status="Purged"
+                 data-kind="PURGED"
+                 data-hard="false"
+                 data-risk="${this.escape(risk.score)}"
+                 data-confidence="${this.escape(confidence.score)}"
+                 data-reports="${this.escape(reports)}"
+                 data-time="${this.escape(timeValue)}"
+                 class="ac-case ac-accent-green ac-purged-case">
+                <div class="ac-case-summary">
+                    <div class="ac-case-person">
+                        <div class="ac-person-title">
+                            ${this.playerLink(item)}
+                            <span class="ac-badge ac-badge-green">Purged</span>
+                        </div>
+                        <div class="ac-muted-line">GUID ${this.escape(item.guid || 'Unknown')}</div>
+                        <div class="ac-muted-line">${this.escape(item.server || 'Unknown server')} · ${this.escape(item.map || 'Unknown map')}</div>
+                    </div>
+                    <div class="ac-case-main">
+                        <p>Evidence is hidden and recoverable until ${this.localTimeElement(item.deleteAfter, item.deleteAfter || 'the recovery deadline')}.</p>
+                        <div class="ac-status-row">
+                            <span>Purged by ${this.escape(item.purgedBy || 'Unknown Admin')}</span>
+                            <span>${events} ${events === 1 ? 'event' : 'events'} retained for recovery</span>
+                        </div>
+                    </div>
+                    <div class="ac-case-aside">
+                        <div class="ac-mini-metrics">
+                            ${this.miniMetric('Risk', risk.score + '/100', risk.tone)}
+                            ${this.miniMetric('Confidence', confidence.label, confidence.tone)}
+                            ${this.miniMetric('Reports', reports, 'slate')}
+                            ${this.miniMetric('Events', events, 'slate')}
+                        </div>
+                    </div>
+                </div>
+                <div class="ac-case-footer">
+                    <div class="ac-actions">
+                        <button type="button"
+                                data-ac-recover="true"
+                                data-case-id="${this.escape(item.caseId || caseKey)}">Recover</button>
+                    </div>
                 </div>
             </div>`;
     },
@@ -745,6 +999,9 @@ const plugin = {
                                 data-case-id="${this.escape(target.caseId || caseKey)}"
                                 ${status === 'Cleared' ? 'disabled' : ''}>Clear</button>
                         <button type="button"
+                                data-ac-purge="true"
+                                data-case-id="${this.escape(target.caseId || caseKey)}">Purge</button>
+                        <button type="button"
                                 data-ac-review="true"
                                 data-case-id="${this.escape(target.caseId || caseKey)}"
                                 ${reviewSent ? 'disabled' : ''}>${this.escape(reviewLabel)}</button>
@@ -801,6 +1058,38 @@ const plugin = {
                     </div>
                 </section>
 
+                ${this.caseProfileScript()}
+            </div>`;
+    },
+
+    renderPurgedCaseProfile: function (entry, actionResult) {
+        const snapshot = entry && entry.snapshot ? entry.snapshot : {};
+        const caseId = entry.caseId || snapshot.caseId || '';
+        const player = entry.playerName || snapshot.player || 'Unknown player';
+        const guid = entry.playerGuid || snapshot.guid || 'Unknown GUID';
+        const deleteAfter = entry.deleteAfter || '';
+
+        return `
+            <div id="anticheat-metrics-panel" class="ac-dashboard ac-profile">
+                ${this.dashboardStyles()}
+                ${actionResult ? this.actionNotice(actionResult) : ''}
+                <header class="ac-page-header">
+                    <div>
+                        <h1 class="ac-title">Case pending purge</h1>
+                        <p class="ac-subtitle">${this.escape(player)} · ${this.escape(guid)}</p>
+                    </div>
+                    <div class="ac-header-meta">
+                        <button type="button" class="ac-back-button" data-ac-back="true">Back to queue</button>
+                    </div>
+                </header>
+                <section class="ac-purge-pending">
+                    <div>
+                        <h2>Evidence hidden</h2>
+                        <p>This evidence record is recoverable until ${this.localTimeElement(deleteAfter, deleteAfter || 'the retention deadline')}. After that deadline, the captured evidence will be permanently deleted.</p>
+                        <p class="ac-muted-line">Purged by ${this.escape(entry.purgedBy || 'Unknown Admin')} · ${this.localTimeElement(entry.purgedAt, entry.purgedAt || 'Unknown')}</p>
+                    </div>
+                    <button type="button" data-ac-undo-purge="true" data-case-id="${this.escape(caseId)}">Undo Purge</button>
+                </section>
                 ${this.caseProfileScript()}
             </div>`;
     },
@@ -906,40 +1195,57 @@ const plugin = {
                         const doc = new DOMParser().parseFromString(html, 'text/html');
                         const nextPanel = doc.getElementById('anticheat-metrics-panel');
                         const currentPanel = document.getElementById('anticheat-metrics-panel');
-                        if (nextPanel && currentPanel) currentPanel.replaceWith(nextPanel);
+                        if (nextPanel && currentPanel) {
+                            currentPanel.replaceWith(nextPanel);
+                            bind();
+                        }
                     };
                     const run = (button, action) => {
                         const caseId = button.getAttribute('data-case-id') || '';
                         if (!caseId || button.disabled) return;
                         if (action === 'clear' && !confirm('Mark this anti-cheat case as cleared? Evidence will be kept.')) return;
+                        if (action === 'purge' && !confirm('Are you 100% sure you want to purge this case? The evidence will be hidden immediately and permanently deleted in 5 days unless you click Undo Purge.')) return;
+                        if (action === 'undo-purge' && !confirm('Restore this case and its evidence to the anti-cheat review system?')) return;
                         if (action === 'send-review' && !confirm('Send this case to the Discord staff review webhook?')) return;
                         const previous = button.textContent;
                         button.disabled = true;
-                        button.textContent = action === 'watch' ? 'Watching...' : (action === 'unwatch' ? 'Removing...' : (action === 'clear' ? 'Clearing...' : 'Sending...'));
+                        button.textContent = action === 'watch' ? 'Watching...'
+                            : (action === 'unwatch' ? 'Removing...'
+                            : (action === 'clear' ? 'Clearing...'
+                            : (action === 'purge' ? 'Purging...'
+                            : (action === 'undo-purge' ? 'Restoring...' : 'Sending...'))));
                         fetch(actionUrl({ acAction: action, caseId: caseId }), { cache: 'no-store', credentials: 'same-origin' })
                             .then(response => response.text())
                             .then(replacePanel)
                             .catch(() => { button.disabled = false; button.textContent = previous; });
                     };
-                    document.querySelectorAll('#anticheat-metrics-panel button[data-ac-watch-action]').forEach(button => button.addEventListener('click', () => run(button, button.getAttribute('data-ac-watch-action') || 'watch')));
-                    document.querySelectorAll('#anticheat-metrics-panel button[data-ac-clear]').forEach(button => button.addEventListener('click', () => run(button, 'clear')));
-                    document.querySelectorAll('#anticheat-metrics-panel button[data-ac-review]').forEach(button => button.addEventListener('click', () => run(button, 'send-review')));
-                    document.querySelectorAll('#anticheat-metrics-panel button[data-ac-back]').forEach(button => button.addEventListener('click', () => {
-                        const url = new URL(window.location.href);
-                        url.searchParams.delete('acCase');
-                        url.searchParams.delete('acAction');
-                        url.searchParams.delete('caseId');
-                        window.location.href = url.toString();
-                    }));
                     const formatter = new Intl.DateTimeFormat(undefined, {
                         year: 'numeric', month: '2-digit', day: '2-digit',
                         hour: '2-digit', minute: '2-digit', second: '2-digit',
                         fractionalSecondDigits: 3, timeZoneName: 'short'
                     });
-                    document.querySelectorAll('#anticheat-metrics-panel .js-local-time').forEach(element => {
-                        const date = new Date(element.getAttribute('datetime'));
-                        if (!Number.isNaN(date.getTime())) element.textContent = formatter.format(date);
-                    });
+                    const bind = () => {
+                        document.querySelectorAll('#anticheat-metrics-panel button:not([data-ac-bound])').forEach(button => {
+                            if (button.hasAttribute('data-ac-watch-action')) button.addEventListener('click', () => run(button, button.getAttribute('data-ac-watch-action') || 'watch'));
+                            if (button.hasAttribute('data-ac-clear')) button.addEventListener('click', () => run(button, 'clear'));
+                            if (button.hasAttribute('data-ac-purge')) button.addEventListener('click', () => run(button, 'purge'));
+                            if (button.hasAttribute('data-ac-undo-purge')) button.addEventListener('click', () => run(button, 'undo-purge'));
+                            if (button.hasAttribute('data-ac-review')) button.addEventListener('click', () => run(button, 'send-review'));
+                            if (button.hasAttribute('data-ac-back')) button.addEventListener('click', () => {
+                                const url = new URL(window.location.href);
+                                url.searchParams.delete('acCase');
+                                url.searchParams.delete('acAction');
+                                url.searchParams.delete('caseId');
+                                window.location.href = url.toString();
+                            });
+                            button.setAttribute('data-ac-bound', 'true');
+                        });
+                        document.querySelectorAll('#anticheat-metrics-panel .js-local-time').forEach(element => {
+                            const date = new Date(element.getAttribute('datetime'));
+                            if (!Number.isNaN(date.getTime())) element.textContent = formatter.format(date);
+                        });
+                    };
+                    bind();
                 })();
             </script>`;
     },
@@ -1199,6 +1505,23 @@ const plugin = {
                     border-radius: 11px;
                     background: rgba(255,255,255,.018);
                 }
+                #anticheat-metrics-panel .ac-metrics-strip .ac-stat.ac-tone-blue {
+                    border-color: rgba(91, 156, 255, .68);
+                    animation: ac-monitoring-pulse 2.2s ease-out infinite;
+                }
+                @keyframes ac-monitoring-pulse {
+                    0% {
+                        box-shadow: 0 0 0 0 rgba(91, 156, 255, .34);
+                    }
+                    72%, 100% {
+                        box-shadow: 0 0 0 8px rgba(91, 156, 255, 0);
+                    }
+                }
+                @media (prefers-reduced-motion: reduce) {
+                    #anticheat-metrics-panel .ac-metrics-strip .ac-stat.ac-tone-blue {
+                        animation: none;
+                    }
+                }
                 #anticheat-metrics-panel .ac-stat:last-child { border-right: 1px solid var(--ac-line); }
                 #anticheat-metrics-panel .ac-stat-label,
                 #anticheat-metrics-panel .ac-section-label,
@@ -1313,10 +1636,33 @@ const plugin = {
                 #anticheat-metrics-panel .ac-actions button[data-ac-open],
                 #anticheat-metrics-panel .ac-actions button[data-ac-watch-action],
                 #anticheat-metrics-panel .ac-actions button[data-ac-clear],
+                #anticheat-metrics-panel .ac-actions button[data-ac-purge],
+                #anticheat-metrics-panel .ac-actions button[data-ac-recover],
+                #anticheat-metrics-panel button[data-ac-undo-purge],
                 #anticheat-metrics-panel .ac-actions button[data-ac-review] {
                     cursor: pointer;
                     opacity: 1;
                     color: #dce5ef;
+                }
+                #anticheat-metrics-panel .ac-actions button[data-ac-purge] {
+                    color: #f0a0a0;
+                    border-color: rgba(239,115,115,.35);
+                    background: rgba(239,115,115,.06);
+                }
+                #anticheat-metrics-panel .ac-actions button[data-ac-purge]:hover,
+                #anticheat-metrics-panel button[data-ac-undo-purge]:hover {
+                    border-color: rgba(239,115,115,.55);
+                    background: rgba(239,115,115,.11);
+                }
+                #anticheat-metrics-panel .ac-actions button[data-ac-recover] {
+                    color: #b8e8c9;
+                    border-color: rgba(120,198,154,.36);
+                    background: rgba(120,198,154,.08);
+                }
+                #anticheat-metrics-panel .ac-actions button[data-ac-recover]:hover {
+                    color: #d5f4df;
+                    border-color: rgba(120,198,154,.58);
+                    background: rgba(120,198,154,.14);
                 }
                 #anticheat-metrics-panel .ac-actions button[disabled] {
                     cursor: not-allowed;
@@ -1647,6 +1993,36 @@ const plugin = {
                     padding: 16px;
                     margin: 14px 0;
                 }
+                #anticheat-metrics-panel .ac-purge-pending {
+                    display: flex;
+                    align-items: flex-start;
+                    justify-content: space-between;
+                    gap: 24px;
+                    margin: 20px 0;
+                    padding: 20px;
+                    border: 1px solid rgba(239,115,115,.25);
+                    border-radius: 12px;
+                    background: rgba(239,115,115,.04);
+                }
+                #anticheat-metrics-panel .ac-purge-pending h2 {
+                    margin: 0 0 8px;
+                    color: #f0b0b0;
+                    font-size: 16px;
+                }
+                #anticheat-metrics-panel .ac-purge-pending p {
+                    margin: 0;
+                    color: var(--ac-text);
+                    line-height: 1.55;
+                }
+                #anticheat-metrics-panel .ac-purge-pending button {
+                    flex: 0 0 auto;
+                    min-height: 34px;
+                    padding: 7px 11px;
+                    border: 1px solid rgba(239,115,115,.35);
+                    border-radius: 8px;
+                    background: rgba(239,115,115,.06);
+                    color: #f0b0b0;
+                }
                 #anticheat-metrics-panel .ac-profile-fields {
                     display: grid;
                     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1697,12 +2073,93 @@ const plugin = {
                     margin-top: 4px;
                     color: var(--ac-muted-2);
                 }
+                #anticheat-metrics-panel .ac-system-status {
+                    margin-top: 28px;
+                    padding: 20px 22px;
+                    border: 1px solid var(--ac-line);
+                    border-radius: 10px;
+                    background: rgba(255,255,255,.012);
+                }
+                #anticheat-metrics-panel .ac-system-heading {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    gap: 18px;
+                    margin-bottom: 18px;
+                }
+                #anticheat-metrics-panel .ac-system-overall {
+                    display: inline-flex;
+                    align-items: center;
+                    min-height: 28px;
+                    padding: 4px 9px;
+                    border: 1px solid var(--ac-line);
+                    border-radius: 999px;
+                    color: var(--ac-muted);
+                    font-size: 11px;
+                    white-space: nowrap;
+                }
+                #anticheat-metrics-panel .ac-system-overall.is-good { color: #a5d7ba; border-color: rgba(120,198,154,.18); }
+                #anticheat-metrics-panel .ac-system-overall.is-warning { color: #ddc186; border-color: rgba(217,164,65,.18); }
+                #anticheat-metrics-panel .ac-system-overall.is-bad { color: #eda1a1; border-color: rgba(239,115,115,.2); }
+                #anticheat-metrics-panel .ac-system-core {
+                    display: grid;
+                    grid-template-columns: repeat(4, minmax(0, 1fr));
+                    gap: 10px;
+                    padding-bottom: 18px;
+                    border-bottom: 1px solid var(--ac-line);
+                }
+                #anticheat-metrics-panel .ac-system-servers { display: grid; gap: 0; margin-top: 6px; }
+                #anticheat-metrics-panel .ac-system-server {
+                    display: grid;
+                    grid-template-columns: minmax(220px, 1.35fr) repeat(3, minmax(150px, 1fr));
+                    gap: 12px;
+                    align-items: center;
+                    padding: 13px 0;
+                    border-bottom: 1px solid var(--ac-line);
+                }
+                #anticheat-metrics-panel .ac-system-server:last-child { border-bottom: 0; }
+                #anticheat-metrics-panel .ac-system-server-name { min-width: 0; }
+                #anticheat-metrics-panel .ac-system-server-name strong,
+                #anticheat-metrics-panel .ac-system-server-name span {
+                    display: block;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                }
+                #anticheat-metrics-panel .ac-system-server-name strong { color: var(--ac-text); font-size: 13px; font-weight: 620; }
+                #anticheat-metrics-panel .ac-system-server-name span { margin-top: 4px; color: var(--ac-muted-2); font-size: 11px; }
+                #anticheat-metrics-panel .ac-system-cell {
+                    display: flex;
+                    align-items: center;
+                    gap: 9px;
+                    min-width: 0;
+                    padding: 8px 9px;
+                    border-radius: 7px;
+                    background: rgba(255,255,255,.014);
+                }
+                #anticheat-metrics-panel .ac-system-cell i { flex: 0 0 auto; color: var(--ac-muted-2); font-size: 17px; }
+                #anticheat-metrics-panel .ac-system-cell div { min-width: 0; }
+                #anticheat-metrics-panel .ac-system-cell span,
+                #anticheat-metrics-panel .ac-system-cell strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                #anticheat-metrics-panel .ac-system-cell span { color: var(--ac-muted-2); font-size: 10px; }
+                #anticheat-metrics-panel .ac-system-cell strong { margin-top: 2px; color: var(--ac-muted); font-size: 11.5px; font-weight: 600; }
+                #anticheat-metrics-panel .ac-system-good i,
+                #anticheat-metrics-panel .ac-system-good strong { color: #a5d7ba; }
+                #anticheat-metrics-panel .ac-system-warning i,
+                #anticheat-metrics-panel .ac-system-warning strong { color: #ddc186; }
+                #anticheat-metrics-panel .ac-system-bad i,
+                #anticheat-metrics-panel .ac-system-bad strong { color: #eda1a1; }
+                #anticheat-metrics-panel .ac-system-note,
+                #anticheat-metrics-panel .ac-system-empty { margin: 13px 0 0; color: var(--ac-muted-2); font-size: 11px; line-height: 1.5; }
                 @media (max-width: 1180px) {
                     #anticheat-metrics-panel .ac-metrics-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
                     #anticheat-metrics-panel .ac-case-summary { flex-wrap: wrap; }
                     #anticheat-metrics-panel .ac-case-person { flex-basis: 280px; }
                     #anticheat-metrics-panel .ac-case-aside { flex: 1 1 100%; }
                     #anticheat-metrics-panel .ac-recommendation { text-align: left; }
+                    #anticheat-metrics-panel .ac-system-core { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+                    #anticheat-metrics-panel .ac-system-server { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+                    #anticheat-metrics-panel .ac-system-server-name { grid-column: 1 / -1; }
                 }
                 @media (max-width: 760px) {
                     #anticheat-metrics-panel.ac-dashboard { padding: 10px 12px 26px; }
@@ -1733,6 +2190,7 @@ const plugin = {
                     #anticheat-metrics-panel .ac-debug-list,
                     #anticheat-metrics-panel .ac-raw-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
                     #anticheat-metrics-panel .ac-evidence-details { margin-left: 0; text-align: left; }
+                    #anticheat-metrics-panel .ac-system-heading { align-items: flex-start; flex-direction: column; }
                 }
                 @media (max-width: 520px) {
                     #anticheat-metrics-panel .ac-metrics-strip,
@@ -1748,6 +2206,10 @@ const plugin = {
                     #anticheat-metrics-panel .ac-stat-value { font-size: 23px; }
                     #anticheat-metrics-panel .ac-controls { display: grid; grid-template-columns: 1fr; }
                     #anticheat-metrics-panel .ac-control select { width: 100%; }
+                    #anticheat-metrics-panel .ac-system-status { padding: 16px; }
+                    #anticheat-metrics-panel .ac-system-core,
+                    #anticheat-metrics-panel .ac-system-server { grid-template-columns: 1fr; }
+                    #anticheat-metrics-panel .ac-system-server-name { grid-column: auto; }
                 }
             </style>`;
     },
@@ -1770,7 +2232,7 @@ const plugin = {
             return null;
         }
 
-        if (action !== 'watch' && action !== 'unwatch' && action !== 'clear' && action !== 'send-review') {
+        if (action !== 'watch' && action !== 'unwatch' && action !== 'clear' && action !== 'purge' && action !== 'undo-purge' && action !== 'send-review') {
             return {
                 success: false,
                 message: 'Unknown anti-cheat action.',
@@ -1795,6 +2257,12 @@ const plugin = {
         }
         if (action === 'clear') {
             return this.markCaseCleared(caseId, originId);
+        }
+        if (action === 'purge') {
+            return this.purgeCase(caseId, originId);
+        }
+        if (action === 'undo-purge') {
+            return this.undoPurgeCase(caseId, originId);
         }
         return this.sendCaseReview(caseId, originId);
     },
@@ -2102,6 +2570,324 @@ const plugin = {
         };
     },
 
+    purgeCase: function (caseId, originId) {
+        const target = this.findCase(caseId);
+        if (!target) {
+            return {
+                success: false,
+                message: 'Unable to purge case.',
+                detail: 'The case could not be found in the current anti-cheat data.'
+            };
+        }
+
+        const state = this.readWatchState();
+        const key = this.watchKey(target);
+        if (state.purges[key] && state.purges[key].status === 'pending') {
+            return {
+                success: true,
+                message: 'Case is already pending purge.',
+                detail: 'Use Undo Purge before the recovery deadline to restore it.'
+            };
+        }
+
+        const now = new Date();
+        const retentionDays = Math.max(1, Number(this.settings.purgeRetentionDays || 5));
+        const deleteAfter = new Date(now.getTime() + retentionDays * 24 * 60 * 60 * 1000).toISOString();
+        const timestamp = now.toISOString();
+        const admin = this.adminNameFromOrigin(originId);
+        const reason = `Purged evidence by ${admin} @ ${this.formatActionTime(timestamp)} via Anticheat Panel. Permanent deletion scheduled after ${retentionDays} days.`;
+        const fingerprints = this.collectPurgeFingerprints(target);
+
+        state.purges[key] = {
+            caseId: target.caseId,
+            playerGuid: target.guid || '',
+            playerName: target.player || 'Unknown',
+            clientId: target.client || '',
+            profileId: target.profileId || this.profileIdFor(target) || '',
+            status: 'pending',
+            purgedAt: timestamp,
+            purgedBy: admin,
+            deleteAfter: deleteAfter,
+            eventFingerprints: fingerprints,
+            snapshot: this.purgeSnapshot(target)
+        };
+        this.pushActionRecord(state, this.actionRecord(target, 'purge', admin, timestamp, reason, {
+            deleteAfter: deleteAfter,
+            purgedEventCount: fingerprints.length
+        }));
+
+        if (!this.writeWatchState(state)) {
+            return {
+                success: false,
+                message: 'Unable to purge case.',
+                detail: 'The purge recovery state could not be saved. No evidence was hidden.'
+            };
+        }
+
+        return {
+            success: true,
+            message: 'Case moved to purge recovery.',
+            detail: `Evidence is hidden now and will be permanently deleted after ${this.formatActionTime(deleteAfter)} unless Undo Purge is used.`
+        };
+    },
+
+    undoPurgeCase: function (caseId, originId) {
+        const state = this.readWatchState();
+        const located = this.locatePendingPurge(state, caseId);
+        if (!located) {
+            return {
+                success: false,
+                message: 'Unable to undo purge.',
+                detail: 'No recoverable purge was found for this case.'
+            };
+        }
+
+        const entry = located.entry;
+        const target = entry.snapshot || entry;
+        const now = new Date().toISOString();
+        const admin = this.adminNameFromOrigin(originId);
+        const reason = `Undid evidence purge by ${admin} @ ${this.formatActionTime(now)} via Anticheat Panel.`;
+        delete state.purges[located.key];
+        this.pushActionRecord(state, this.actionRecord(target, 'undo_purge', admin, now, reason, {
+            restoredEventCount: (entry.eventFingerprints || []).length
+        }));
+
+        if (!this.writeWatchState(state)) {
+            return {
+                success: false,
+                message: 'Unable to undo purge.',
+                detail: 'The recovery state could not be updated.'
+            };
+        }
+
+        return {
+            success: true,
+            message: 'Purge undone.',
+            detail: 'The case and its evidence are visible again.'
+        };
+    },
+
+    purgeSnapshot: function (target) {
+        return {
+            caseId: target.caseId || '',
+            player: target.player || 'Unknown',
+            guid: target.guid || '',
+            client: target.client || '',
+            profileId: target.profileId || '',
+            server: target.server || '',
+            map: target.map || target.latestMap || '',
+            status: target.status || '',
+            priority: target.priority || '',
+            overallRisk: Number(target.overallRisk || target.riskScore || 0),
+            confidence: Number(target.confidence || target.confidenceScore || 0),
+            reportsCount: Number(target.reportsCount || target.reports || 0),
+            eventsCount: Number(target.eventsCount || (target.events || []).length),
+            firstSeen: target.firstSeen || '',
+            lastSeen: target.lastSeen || '',
+            mainReason: target.mainReason || '',
+            events: (target.events || []).map(event => Object.assign({}, event))
+        };
+    },
+
+    collectPurgeFingerprints: function (target) {
+        const fingerprints = {};
+        const guid = this.clean(target.guid || target.playerGuid || '').toLowerCase();
+        const caseId = this.clean(target.caseId || '').toLowerCase();
+
+        try {
+            const io = importNamespace('System.IO');
+            const logPath = String(this.settings.logPath || '/app/Logs/anti-cheat-combined.log');
+            if (io.File.Exists(logPath)) {
+                const blocks = String(io.File.ReadAllText(logPath)).split('============================================================');
+                blocks.forEach((block, index) => {
+                    const parsed = this.parseBlock(block);
+                    if (!parsed) {
+                        return;
+                    }
+                    const event = this.normalizeEvent(parsed, index);
+                    const eventGuid = this.clean(event.playerGuid || event.guid || '').toLowerCase();
+                    const matches = guid && eventGuid && guid === eventGuid
+                        ? true
+                        : (!guid && this.clean(event.caseId || '').toLowerCase() === caseId);
+                    if (matches) {
+                        fingerprints[this.purgeFingerprint(event)] = true;
+                    }
+                });
+            }
+        } catch (ex) {
+            if (this.logger) {
+                this.logger.logWarning('{Name} failed to collect purge evidence: {Message}', this.name, ex.message || ex);
+            }
+        }
+
+        (target.events || []).forEach(event => {
+            fingerprints[this.purgeFingerprint(event)] = true;
+        });
+        return Object.keys(fingerprints).filter(Boolean);
+    },
+
+    purgeFingerprint: function (item) {
+        const reasons = item && (item.rawReasons || item.reasons) || [];
+        const seed = [
+            item && (item.timestamp || item.time),
+            item && (item.playerGuid || item.guid || item.playerName || item.player),
+            item && (item.serverName || item.server || item.serverKey),
+            item && item.map,
+            item && (item.kind || item.eventType),
+            item && (item.eventType || item.subType),
+            item && (item.victimName || item.victim),
+            item && item.weapon,
+            Array.isArray(reasons) ? reasons.join('|') : String(reasons || '')
+        ].map(value => this.clean(value)).join('|');
+        return seed ? `purge_evt_${this.stableHash(seed)}` : '';
+    },
+
+    locatePendingPurge: function (state, caseId) {
+        const id = this.clean(caseId || '').toLowerCase();
+        const purges = state && state.purges ? state.purges : {};
+        const keys = Object.keys(purges);
+        for (let i = 0; i < keys.length; i++) {
+            const entry = purges[keys[i]];
+            if (!entry || entry.status !== 'pending') {
+                continue;
+            }
+            if (this.clean(entry.caseId || '').toLowerCase() === id ||
+                this.clean(entry.playerGuid || '').toLowerCase() === id ||
+                keys[i].toLowerCase() === id ||
+                keys[i].toLowerCase() === `case:${id}` ||
+                keys[i].toLowerCase() === `guid:${id}`) {
+                return { key: keys[i], entry: entry };
+            }
+        }
+        return null;
+    },
+
+    pendingPurgeForCase: function (caseId) {
+        const located = this.locatePendingPurge(this.readWatchState(), caseId);
+        return located ? located.entry : null;
+    },
+
+    recoverablePurgedCases: function () {
+        const state = this.readWatchState();
+        return Object.keys(state.purges || {}).map(key => {
+            const entry = state.purges[key];
+            if (!entry || entry.status !== 'pending') {
+                return null;
+            }
+            const snapshot = entry.snapshot || {};
+            return Object.assign({}, snapshot, {
+                caseId: entry.caseId || snapshot.caseId || key,
+                player: entry.playerName || snapshot.player || 'Unknown',
+                guid: entry.playerGuid || snapshot.guid || '',
+                client: entry.clientId || snapshot.client || '',
+                profileId: entry.profileId || snapshot.profileId || '',
+                server: snapshot.server || 'Unknown server',
+                map: snapshot.map || 'Unknown map',
+                status: 'Purged',
+                priority: 'Purged',
+                kind: 'PURGED',
+                events: Array.isArray(snapshot.events) ? snapshot.events : [],
+                reasons: [],
+                reports: Number(snapshot.reportsCount || 0),
+                reportsCount: Number(snapshot.reportsCount || 0),
+                eventsCount: Number(snapshot.eventsCount || (snapshot.events || []).length),
+                riskScore: Number(snapshot.overallRisk || 0),
+                confidenceScore: Number(snapshot.confidence || 0),
+                overallRisk: Number(snapshot.overallRisk || 0),
+                confidence: Number(snapshot.confidence || 0),
+                time: entry.purgedAt || snapshot.lastSeen || '',
+                displayTime: entry.purgedAt || snapshot.lastSeen || '',
+                purgedAt: entry.purgedAt || '',
+                purgedBy: entry.purgedBy || 'Unknown Admin',
+                deleteAfter: entry.deleteAfter || ''
+            });
+        }).filter(Boolean).sort((a, b) => (Date.parse(b.purgedAt || '') || 0) - (Date.parse(a.purgedAt || '') || 0));
+    },
+
+    pendingPurgeFingerprintSet: function (state) {
+        const set = {};
+        const purges = state && state.purges ? state.purges : {};
+        Object.keys(purges).forEach(key => {
+            const entry = purges[key];
+            if (!entry || entry.status !== 'pending') {
+                return;
+            }
+            (entry.eventFingerprints || []).forEach(fingerprint => {
+                set[fingerprint] = true;
+            });
+        });
+        return set;
+    },
+
+    finalizeExpiredPurges: function () {
+        const state = this.readWatchState();
+        const purges = state.purges || {};
+        const now = Date.now();
+        let changed = false;
+
+        Object.keys(purges).forEach(key => {
+            const entry = purges[key];
+            const deadline = Date.parse(entry && entry.deleteAfter || '');
+            if (!entry || entry.status !== 'pending' || !deadline || deadline > now) {
+                return;
+            }
+
+            const result = this.deletePurgedEvidence(entry);
+            if (!result.success) {
+                if (this.logger) {
+                    this.logger.logWarning('{Name} could not finalize purge for {CaseId}: {Message}', this.name, entry.caseId || key, result.message || 'Unknown error');
+                }
+                return;
+            }
+
+            const target = entry.snapshot || entry;
+            const timestamp = new Date().toISOString();
+            this.pushActionRecord(state, this.actionRecord(target, 'purge_expired', 'System', timestamp,
+                `Purge recovery expired; ${result.deletedCount} evidence record(s) were permanently deleted.`, {
+                    deletedEventCount: result.deletedCount
+                }));
+            delete purges[key];
+            changed = true;
+        });
+
+        if (changed) {
+            this.writeWatchState(state);
+        }
+    },
+
+    deletePurgedEvidence: function (entry) {
+        try {
+            const io = importNamespace('System.IO');
+            const logPath = String(this.settings.logPath || '/app/Logs/anti-cheat-combined.log');
+            if (!io.File.Exists(logPath)) {
+                return { success: true, deletedCount: 0, message: 'Evidence log no longer exists.' };
+            }
+
+            const delimiter = '============================================================';
+            const raw = String(io.File.ReadAllText(logPath));
+            const blocks = raw.split(delimiter);
+            const fingerprints = {};
+            (entry.eventFingerprints || []).forEach(value => { fingerprints[value] = true; });
+            let output = blocks[0];
+            let deletedCount = 0;
+
+            for (let i = 1; i < blocks.length; i++) {
+                const parsed = this.parseBlock(blocks[i]);
+                const event = parsed ? this.normalizeEvent(parsed, i) : null;
+                if (event && fingerprints[this.purgeFingerprint(event)]) {
+                    deletedCount++;
+                    continue;
+                }
+                output += delimiter + blocks[i];
+            }
+
+            io.File.WriteAllText(logPath, output);
+            return { success: true, deletedCount: deletedCount, message: 'Expired evidence was permanently deleted.' };
+        } catch (ex) {
+            return { success: false, deletedCount: 0, message: ex.message || String(ex) };
+        }
+    },
+
     sendCaseReview: function (caseId, originId) {
         const target = this.findCase(caseId);
         if (!target) {
@@ -2210,7 +2996,10 @@ const plugin = {
 
     buildCases: function (items) {
         const groups = {};
-        const normalizedItems = (items || []).map((sourceItem, index) => sourceItem.eventId ? sourceItem : this.normalizeEvent(sourceItem, index));
+        let normalizedItems = (items || []).map((sourceItem, index) => sourceItem.eventId ? sourceItem : this.normalizeEvent(sourceItem, index));
+        const watchState = this.readWatchState();
+        const purgedFingerprints = this.pendingPurgeFingerprintSet(watchState);
+        normalizedItems = normalizedItems.filter(item => !purgedFingerprints[this.purgeFingerprint(item)]);
         const guidAliases = {};
 
         normalizedItems.forEach(item => {
@@ -2227,6 +3016,11 @@ const plugin = {
             if (aliasCaseId) {
                 item.caseId = aliasCaseId;
             }
+        });
+
+        normalizedItems = this.promoteTimelineEvidence(normalizedItems);
+
+        normalizedItems.forEach(item => {
 
             const key = item.caseId;
 
@@ -2357,7 +3151,7 @@ const plugin = {
             if (item.eventType === 'iw4m_hard_detection' || this.isHardDetection(item)) {
                 group.hardDetectionCount++;
             } else {
-                group.softSuspicionCount++;
+                group.softSuspicionCount += Math.max(1, Number(item.sourceEventCount || 1));
             }
 
             (item.rawReasons || item.reasons || []).forEach(reason => {
@@ -2370,12 +3164,198 @@ const plugin = {
             });
         });
 
-        const watchState = this.readWatchState();
         const cases = Object.keys(groups)
             .map(key => this.applyWatchState(this.finalizeCase(groups[key]), watchState))
             .filter(group => this.shouldShowCaseInReviewQueue(group));
         cases.sort((a, b) => this.riskInfo(b).score - this.riskInfo(a).score);
         return cases;
+    },
+
+    promoteTimelineEvidence: function (events) {
+        const source = (events || []).slice();
+        const protectedEvents = [];
+        const candidatesByCase = {};
+        const reportTimesByCase = {};
+        const retainedCaseKeys = this.retainedTimelineCaseKeys();
+
+        source.forEach(event => {
+            const caseId = this.clean(event.caseId || this.caseIdForEvent(event), '');
+            const caseKey = `case:${caseId.toLowerCase()}`;
+            const guidKey = `guid:${this.clean(event.playerGuid || event.guid || '').toLowerCase()}`;
+            const retainFullCase = retainedCaseKeys[caseKey] || (guidKey !== 'guid:' && retainedCaseKeys[guidKey]);
+
+            if (event.eventType === 'player_report' || this.itemLooksLikeReport(event)) {
+                reportTimesByCase[caseId] = reportTimesByCase[caseId] || [];
+                reportTimesByCase[caseId].push(Date.parse(event.timestamp || event.time || '') || 0);
+            }
+
+            if (retainFullCase || this.isProtectedTimelineEvent(event) || this.isMeaningfulTimelineEvent(event)) {
+                event.sourceEventCount = Math.max(1, Number(event.sourceEventCount || 1));
+                protectedEvents.push(event);
+                return;
+            }
+
+            candidatesByCase[caseId] = candidatesByCase[caseId] || [];
+            candidatesByCase[caseId].push(event);
+        });
+
+        const promoted = protectedEvents.slice();
+        Object.keys(candidatesByCase).forEach(caseId => {
+            const candidates = candidatesByCase[caseId]
+                .filter(event => Number.isFinite(Date.parse(event.timestamp || event.time || '')))
+                .sort((a, b) => Date.parse(a.timestamp || a.time) - Date.parse(b.timestamp || b.time));
+            const windows = this.timelineCandidateWindows(candidates);
+
+            windows.forEach(windowEvents => {
+                const aggregate = this.aggregateCandidateWindow(caseId, windowEvents, reportTimesByCase[caseId] || []);
+                if (aggregate) promoted.push(aggregate);
+            });
+        });
+
+        return promoted.sort((a, b) => (Date.parse(b.timestamp || b.time || '') || 0) - (Date.parse(a.timestamp || a.time || '') || 0));
+    },
+
+    retainedTimelineCaseKeys: function () {
+        const state = this.readWatchState();
+        const result = {};
+        ['watches', 'clears'].forEach(section => {
+            const entries = state && state[section] || {};
+            Object.keys(entries).forEach(key => { result[String(key).toLowerCase()] = true; });
+        });
+        return result;
+    },
+
+    isProtectedTimelineEvent: function (event) {
+        const type = String(event && event.eventType || '').toLowerCase();
+        const kind = String(event && event.kind || '').toUpperCase();
+        return this.isHardDetection(event) ||
+            type === 'iw4m_hard_detection' ||
+            type === 'player_report' ||
+            type === 'moderation_action' ||
+            type === 'manual_note' ||
+            Boolean(event && (event.action || event.isAutomatedBan || event.crossedDiscordAlertRules)) ||
+            kind === 'ALERT' || kind === 'REVIEW_ALERT' || kind === 'AUTO_BAN' || kind === 'AUTO_TEMPBAN';
+    },
+
+    isMeaningfulTimelineEvent: function (event) {
+        const risk = Number(event && event.riskScore || 0);
+        const confidence = Number(event && event.confidenceScore || 0);
+        const highFalsePositiveRisk = String(event && event.falsePositiveRisk || '').toLowerCase() === 'high';
+        return risk >= Number(this.settings.candidateMinRisk || 65) &&
+            confidence >= Number(this.settings.candidateMinConfidence || 55) &&
+            !highFalsePositiveRisk;
+    },
+
+    timelineCandidateWindows: function (events) {
+        const windowMs = Math.max(1, Number(this.settings.candidateWindowMinutes || 15)) * 60 * 1000;
+        const windows = [];
+        let current = [];
+        let windowStartedAt = 0;
+
+        (events || []).forEach(event => {
+            const at = Date.parse(event.timestamp || event.time || '') || 0;
+            if (!current.length || at - windowStartedAt <= windowMs) {
+                if (!current.length) windowStartedAt = at;
+                current.push(event);
+                return;
+            }
+            windows.push(current);
+            current = [event];
+            windowStartedAt = at;
+        });
+        if (current.length) windows.push(current);
+        return windows;
+    },
+
+    aggregateCandidateWindow: function (caseId, events, reportTimes) {
+        if (!events || !events.length) return null;
+        const familyCounts = {};
+        events.forEach(event => {
+            this.timelineSignalFamilies(event).forEach(family => {
+                familyCounts[family] = (familyCounts[family] || 0) + 1;
+            });
+        });
+
+        const dominant = Object.keys(familyCounts).sort((a, b) => familyCounts[b] - familyCounts[a])[0] || 'general';
+        const similarCount = familyCounts[dominant] || 0;
+        const distinctFamilies = Object.keys(familyCounts).filter(family => family !== 'general').length;
+        const start = Date.parse(events[0].timestamp || events[0].time || '') || 0;
+        const end = Date.parse(events[events.length - 1].timestamp || events[events.length - 1].time || '') || start;
+        const windowMs = Math.max(1, Number(this.settings.candidateWindowMinutes || 15)) * 60 * 1000;
+        const reportSupported = (reportTimes || []).some(at => at > 0 && at >= start - windowMs && at <= end + windowMs);
+        const repeatedSupported = similarCount >= Number(this.settings.candidateMinSimilarEvents || 3) && distinctFamilies >= 2;
+        const reportPattern = reportSupported && events.some(event => Number(event.riskScore || 0) >= 45 && Number(event.confidenceScore || 0) >= 30);
+
+        if (!repeatedSupported && !reportPattern) return null;
+
+        const latest = events[events.length - 1];
+        const maxRisk = Math.max(...events.map(event => Number(event.riskScore || 0)));
+        const maxConfidence = Math.max(...events.map(event => Number(event.confidenceScore || 0)));
+        const durationMinutes = Math.max(1, Math.ceil((end - start) / 60000));
+        const familyLabel = this.timelineFamilyLabel(dominant);
+        const uniqueReasons = [];
+        events.forEach(event => (event.rawReasons || event.reasons || []).forEach(reason => {
+            if (reason && uniqueReasons.indexOf(reason) === -1 && uniqueReasons.length < 4) uniqueReasons.push(reason);
+        }));
+
+        return Object.assign({}, latest, {
+            eventId: `pattern:${this.stableHash(`${caseId}|${start}|${end}|${dominant}`)}`,
+            caseId: caseId,
+            kind: 'PATTERN',
+            eventType: this.timelineFamilyEventType(dominant, latest.eventType),
+            subType: 'aggregated_pattern',
+            sourceEventCount: events.length,
+            aggregated: true,
+            rawScore: `${events.length} buffered events`,
+            riskScore: this.clampScore(maxRisk + Math.min(12, Math.max(0, events.length - 1) * 3)),
+            confidenceScore: this.clampScore(maxConfidence + Math.min(15, Math.max(0, similarCount - 1) * 4 + Math.max(0, distinctFamilies - 1) * 3 + (reportSupported ? 5 : 0))),
+            evidenceQuality: 'Aggregated repeated pattern',
+            falsePositiveRisk: distinctFamilies >= 2 || reportSupported ? 'Medium' : 'High',
+            crossedDiscordAlertRules: false,
+            discordStatus: 'evidence_only',
+            rawReasons: [
+                `${events.length} buffered suspicious events formed one reviewable pattern over ${durationMinutes} minute${durationMinutes === 1 ? '' : 's'}.`,
+                `${similarCount} were ${familyLabel}; supporting signal families: ${Object.keys(familyCounts).map(this.timelineFamilyLabel.bind(this)).join(', ')}.`
+            ].concat(uniqueReasons),
+            rawData: JSON.stringify({
+                bufferWindowMinutes: Number(this.settings.candidateWindowMinutes || 15),
+                sourceEventCount: events.length,
+                familyCounts: familyCounts,
+                reportSupported: reportSupported,
+                sourceEventIds: events.map(event => event.eventId)
+            })
+        });
+    },
+
+    timelineSignalFamily: function (event) {
+        return this.timelineSignalFamilies(event)[0] || 'general';
+    },
+
+    timelineSignalFamilies: function (event) {
+        const text = this.eventText(event);
+        const type = String(event && event.eventType || '').toLowerCase();
+        const families = [];
+        if (type === 'recoil_suspicion' || text.indexOf('recoil') !== -1) families.push('recoil');
+        if (this.isAimLockLikeEvent(event) || this.hasStrongAimAngle(event)) families.push('aim');
+        if (this.isSoftEspOrLosEvent(event)) families.push('esp_los');
+        if (text.indexOf('headshot') !== -1 || text.indexOf('head hit') !== -1 || text.indexOf('neck') !== -1) families.push('hit_pattern');
+        if (text.indexOf('many kills') !== -1 || text.indexOf('short window') !== -1) families.push('kill_pattern');
+        return families.length ? families : ['general'];
+    },
+
+    timelineFamilyLabel: function (family) {
+        return ({
+            aim: 'aim-related anomalies',
+            esp_los: 'visibility or hidden-tracking anomalies',
+            recoil: 'recoil anomalies',
+            hit_pattern: 'repeated hit-location anomalies',
+            kill_pattern: 'short-window kill patterns',
+            general: 'general weak signals'
+        })[family] || family;
+    },
+
+    timelineFamilyEventType: function (family, fallback) {
+        return ({ aim: 'aim_suspicion', esp_los: 'esp_suspicion', recoil: 'recoil_suspicion', hit_pattern: 'aim_suspicion' })[family] || fallback || 'aim_suspicion';
     },
 
     shouldShowCaseInReviewQueue: function (group) {
@@ -2512,7 +3492,8 @@ const plugin = {
         const strongAngleEvents = events.filter(event => this.hasStrongAimAngle(event)).length;
         const hardAimEvents = events.filter(event => this.isHardDetection(event) || this.isAimLockLikeEvent(event)).length;
         const suspiciousCategories = this.suspiciousCategoryCount(events, reports, hard);
-        const repeatedBonus = Math.min(18, Math.max(0, events.length - 1) * 4);
+        const evidenceEventCount = events.reduce((sum, event) => sum + Math.max(1, Number(event.sourceEventCount || 1)), 0);
+        const repeatedBonus = Math.min(18, Math.max(0, evidenceEventCount - 1) * 4);
         const hardBonus = Math.min(12, hard * 4);
         const reportBonus = Math.min(18, uniqueReporters * 7 + Math.max(0, reports - uniqueReporters) * 3);
         const maxRisk = Math.max(0, ...events.map(event => Number(event.riskScore || 0)));
@@ -2548,7 +3529,7 @@ const plugin = {
         group.uniqueReporters = uniqueReporters;
         group.uniqueVictims = uniqueVictims;
         group.suspiciousCategories = suspiciousCategories;
-        group.eventsCount = events.length;
+        group.eventsCount = evidenceEventCount;
         group.discordAlertCount = group.discordAlertCount || group.alerts || 0;
         group.actionsTakenCount = group.actionsTakenCount || group.actions || 0;
         group.latestEvent = group.latest;
@@ -2629,10 +3610,11 @@ const plugin = {
 
     defaultWatchState: function () {
         return {
-            version: 1,
+            version: 2,
             watches: {},
             clears: {},
             reviews: {},
+            purges: {},
             actions: []
         };
     },
@@ -2647,10 +3629,11 @@ const plugin = {
 
             const parsed = JSON.parse(io.File.ReadAllText(path) || '{}');
             return {
-                version: parsed.version || 1,
+                version: Math.max(2, Number(parsed.version || 1)),
                 watches: parsed.watches || {},
                 clears: parsed.clears || {},
                 reviews: parsed.reviews || {},
+                purges: parsed.purges || {},
                 actions: Array.isArray(parsed.actions) ? parsed.actions : []
             };
         } catch (ex) {
@@ -4455,12 +5438,13 @@ const plugin = {
         io.File.AppendAllText(path, `${block}\n`);
     },
 
-    buildPlayerReportEvent: function (commandEvent, target, reporter, server, text) {
+    buildPlayerReportPenaltyEvent: function (penaltyEvent, penalty, target, reporter, server) {
+        server = server || {};
         const host = this.stripColors(server.hostname || server.Hostname || server.serverName || server.ServerName || server.id || 'Unknown server');
         const map = this.clean(server.mapName || server.MapName || server.currentMap || server.CurrentMap || server.map || server.Map || 'Unknown');
         const targetGuid = this.clientGuid(target);
         const reporterGuid = this.clientGuid(reporter);
-        const reason = this.reportReasonText(text);
+        const reason = this.clean(penalty.offense || penalty.Offense || penalty.automatedOffense || penalty.AutomatedOffense || 'No reason supplied');
 
         return {
             time: new Date().toISOString(),
@@ -4476,8 +5460,19 @@ const plugin = {
             reporterGuid: reporterGuid || 'Unknown',
             reporterClient: this.clientSlot(reporter),
             reason: reason || 'No reason supplied',
-            rawCommand: this.clean(text || 'report')
+            rawCommand: 'report',
+            source: 'iw4madmin_report_penalty',
+            penaltyId: this.clean(penalty.id || penalty.Id || penalty.penaltyId || penalty.PenaltyId || '')
         };
+    },
+
+    playerReportDedupeKey: function (event) {
+        return [
+            this.clean(event.guid || event.player || 'unknown').toLowerCase(),
+            this.clean(event.reporterGuid || event.reporterName || 'unknown').toLowerCase(),
+            this.clean(event.serverKey || event.server || 'unknown').toLowerCase(),
+            this.clean(event.reason || '').toLowerCase()
+        ].join('|');
     },
 
     appendPlayerReportLog: function (event) {
@@ -4507,29 +5502,6 @@ const plugin = {
         ].join('\n');
 
         io.File.AppendAllText(path, `${block}\n`);
-    },
-
-    reportReasonText: function (text) {
-        const raw = this.clean(text || '');
-        if (!raw) {
-            return '';
-        }
-
-        return raw.replace(/^!?report\b\s*/i, '').trim() || raw;
-    },
-
-    commandTargetClient: function (event) {
-        if (!event) {
-            return null;
-        }
-
-        return event.target ||
-            event.Target ||
-            event.targetClient ||
-            event.TargetClient ||
-            event.targetEntity ||
-            event.TargetEntity ||
-            null;
     },
 
     serverFromEvent: function (event, client) {

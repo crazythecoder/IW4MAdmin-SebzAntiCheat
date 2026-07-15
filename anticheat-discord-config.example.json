@@ -7,13 +7,19 @@
   "minDiscordEvidenceEvents": 2,
   "allowIncompleteMetricAlerts": false,
   "acLogFile": "/path/to/iw4madmin/Logs/anti-cheat-combined.log",
+  "healthFile": "/path/to/iw4madmin/Logs/anticheat-health.json",
   "databaseFile": "/path/to/iw4madmin/Database/Database.db",
   "clientMapFile": "/path/to/iw4madmin/Logs/iw4m-client-map.json",
   "clientMapRefreshMs": 60000,
   "logs": [
     {
       "name": "IW4x Server",
-      "file": "/path/to/iw4x/server/userraw/logs/games_mp.log"
+      "file": "/path/to/iw4x/server/userraw/logs/games_mp.log",
+      "consoleFile": "/path/to/iw4x/server/userraw/console_mp.log",
+      "serverConfig": "/path/to/iw4x/server/userraw/server.cfg",
+      "customScript": "/path/to/iw4x/server/userraw/scripts/mp/custom.gsc",
+      "antiCheatScript": "/path/to/iw4x/server/userraw/maps/mp/gametypes/_anticheat_suspicion.gsc",
+      "killstreakScript": "/path/to/iw4x/server/userraw/maps/mp/gametypes/_killstreak_logger.gsc"
     }
   ]
 }

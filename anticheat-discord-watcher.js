@@ -49,6 +49,7 @@ function loadConfig() {
     minDiscordEvidenceEvents: Number(config.minDiscordEvidenceEvents || 2),
     allowIncompleteMetricAlerts: config.allowIncompleteMetricAlerts === true,
     acLogFile: config.acLogFile || path.join(__dirname, 'logs', 'anti-cheat-combined.log'),
+    healthFile: config.healthFile || path.join(path.dirname(config.acLogFile || path.join(__dirname, 'logs', 'anti-cheat-combined.log')), 'anticheat-health.json'),
     databaseFile: config.databaseFile || '/home/mw2-cluster/base_files/data/iw4madmin/Database/Database.db',
     clientMapFile: config.clientMapFile || '/home/mw2-cluster/base_files/data/iw4madmin/Logs/iw4m-client-map.json',
     clientMapRefreshMs: Number(config.clientMapRefreshMs || 60000),
@@ -59,6 +60,158 @@ function loadConfig() {
 const config = loadConfig();
 fs.mkdirSync(path.dirname(config.acLogFile), { recursive: true });
 fs.mkdirSync(path.dirname(config.clientMapFile), { recursive: true });
+fs.mkdirSync(path.dirname(config.healthFile), { recursive: true });
+
+const health = {
+  version: 1,
+  startedAt: new Date().toISOString(),
+  generatedAt: new Date().toISOString(),
+  watcher: { status: 'running' },
+  servers: {}
+};
+
+function serverHealth(log) {
+  if (!health.servers[log.name]) {
+    health.servers[log.name] = {
+      name: log.name,
+      file: log.file,
+      consoleFile: log.consoleFile || '',
+      customScript: log.customScript || '',
+      serverConfig: log.serverConfig || '',
+      logReadable: false,
+      antiCheat: { lastSeenAt: null },
+      killstreakLogger: { lastSeenAt: null }
+    };
+  }
+
+  return health.servers[log.name];
+}
+
+function inspectScriptInstallation(log) {
+  const target = serverHealth(log);
+  const now = new Date().toISOString();
+  let customSource = '';
+  let consoleOutput = '';
+  let serverConfig = '';
+
+  try {
+    customSource = log.customScript ? fs.readFileSync(log.customScript, 'utf8') : '';
+  } catch (_) {
+  }
+
+  try {
+    consoleOutput = log.consoleFile ? fs.readFileSync(log.consoleFile, 'utf8') : '';
+  } catch (_) {
+  }
+
+  try {
+    serverConfig = log.serverConfig ? fs.readFileSync(log.serverConfig, 'utf8') : '';
+  } catch (_) {
+  }
+
+  const hostnameMatch = serverConfig.match(/^\s*(?:set|seta)\s+sv_hostname\s+"([^"]+)"/im);
+  target.hostName = clean(hostnameMatch ? hostnameMatch[1] : log.hostName || log.name);
+
+  const compileFailed = /script compile error|unknown function/i.test(consoleOutput);
+  const customLoaded = /Executing 'scripts\/mp\/custom::init'/.test(consoleOutput);
+
+  if (customLoaded && !compileFailed && (!target.lifecycle || target.lifecycle.state === 'loading')) {
+    target.lifecycle = { state: 'running', changedAt: now };
+  }
+  const checks = [
+    {
+      key: 'antiCheat',
+      file: log.antiCheatScript,
+      hook: '_anticheat_suspicion::init',
+      consoleMarker: null
+    },
+    {
+      key: 'killstreakLogger',
+      file: log.killstreakScript,
+      hook: '_killstreak_logger::init',
+      consoleMarker: '[KSLOG] killstreak logger loaded'
+    }
+  ];
+
+  checks.forEach(check => {
+    const previous = target[check.key] || {};
+    const installed = !!check.file && fs.existsSync(check.file);
+    const hooked = !!customSource && customSource.includes(check.hook);
+    const markerSeen = !check.consoleMarker || consoleOutput.includes(check.consoleMarker);
+    let stateName = 'waiting';
+    let detail = 'Waiting for the current game session to load.';
+
+    if (!installed) {
+      stateName = 'missing';
+      detail = `Script file is missing: ${check.file || 'path not configured'}`;
+    } else if (!hooked) {
+      stateName = 'hook_missing';
+      detail = `custom.gsc does not call ${check.hook}.`;
+    } else if (compileFailed) {
+      stateName = 'failed';
+      detail = 'The current IW4X console contains a script compile error.';
+    } else if (customLoaded && markerSeen) {
+      stateName = 'verified';
+      detail = check.consoleMarker
+        ? 'Script file, custom.gsc hook, and runtime load marker were verified.'
+        : 'Script file and custom.gsc hook were verified in a successfully loaded custom script.';
+    }
+
+    target[check.key] = {
+      ...previous,
+      installed,
+      hooked,
+      state: stateName,
+      detail,
+      file: check.file || '',
+      lastSeenAt: stateName === 'verified' ? now : null,
+      lastVerifiedAt: stateName === 'verified' ? now : previous.lastVerifiedAt || null
+    };
+  });
+}
+
+function markScriptHealth(log, component, line) {
+  const target = serverHealth(log);
+  const parts = String(line || '').trim().split(';');
+  target[component] = {
+    lastSeenAt: new Date().toISOString(),
+    lastActivityAt: target[component] && target[component].lastActivityAt || null,
+    state: 'loaded',
+    serverName: clean(parts[1] && parts[1] !== 'LOADED' ? parts[1] : log.name),
+    map: clean(parts[2] || target[component] && target[component].map || ''),
+    gameType: clean(parts[3] || target[component] && target[component].gameType || '')
+  };
+  target.lifecycle = { state: 'running', changedAt: new Date().toISOString() };
+}
+
+function markScriptActivity(log, component) {
+  const target = serverHealth(log);
+  const previous = target[component] || {};
+  target[component] = {
+    ...previous,
+    lastSeenAt: previous.lastSeenAt || new Date().toISOString(),
+    lastActivityAt: new Date().toISOString(),
+    state: previous.state || 'active'
+  };
+}
+
+function writeHealthState() {
+  config.logs.forEach(inspectScriptInstallation);
+  health.generatedAt = new Date().toISOString();
+  health.watcher = {
+    status: 'running',
+    startedAt: health.startedAt,
+    lastHeartbeatAt: health.generatedAt
+  };
+
+  const temporary = `${config.healthFile}.tmp`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(health, null, 2)}\n`, { mode: 0o640 });
+    fs.renameSync(temporary, config.healthFile);
+  } catch (err) {
+    console.error(`[AC-WATCH] Failed to write health state: ${err.message}`);
+  }
+}
 
 function refreshClientMap() {
   const script = path.join(__dirname, 'iw4m-client-map.py');
@@ -876,6 +1029,37 @@ setInterval(() => {
 }, 1200);
 
 function processLine(log, line) {
+  if (line.includes('InitGame')) {
+    const target = serverHealth(log);
+    target.antiCheat = { lastSeenAt: null, lastActivityAt: null, state: 'waiting' };
+    target.killstreakLogger = { lastSeenAt: null, lastActivityAt: null, state: 'waiting' };
+    target.lifecycle = { state: 'loading', changedAt: new Date().toISOString() };
+  }
+
+  if (line.includes('ShutdownGame')) {
+    serverHealth(log).lifecycle = { state: 'stopped', changedAt: new Date().toISOString() };
+  }
+
+  if (line.includes('CUSTOM_AC_STATUS;') || line.includes('CUSTOM_AC_HEALTH;')) {
+    const marker = line.includes('CUSTOM_AC_STATUS;') ? 'CUSTOM_AC_STATUS;' : 'CUSTOM_AC_HEALTH;';
+    markScriptHealth(log, 'antiCheat', line.slice(line.indexOf(marker)));
+    return;
+  }
+
+  if (line.includes('CUSTOM_KILLSTREAK_STATUS;') || line.includes('CUSTOM_KILLSTREAK_HEALTH;')) {
+    const marker = line.includes('CUSTOM_KILLSTREAK_STATUS;') ? 'CUSTOM_KILLSTREAK_STATUS;' : 'CUSTOM_KILLSTREAK_HEALTH;';
+    markScriptHealth(log, 'killstreakLogger', line.slice(line.indexOf(marker)));
+    return;
+  }
+
+  if (line.includes('CUSTOM_AC_')) {
+    markScriptActivity(log, 'antiCheat');
+  }
+
+  if (line.includes('CUSTOM_KILLSTREAK_')) {
+    markScriptActivity(log, 'killstreakLogger');
+  }
+
   const parsedEvidence = parseAcEvidence(line);
 
   if (parsedEvidence) {
@@ -918,10 +1102,19 @@ function processLine(log, line) {
 
 function readNew(log) {
   fs.stat(log.file, (err, stats) => {
+    const targetHealth = serverHealth(log);
+    targetHealth.lastLogCheckAt = new Date().toISOString();
+
     if (err) {
+      targetHealth.logReadable = false;
+      targetHealth.logError = err.message;
       console.error(`[AC-WATCH] Cannot stat ${log.file}: ${err.message}`);
       return;
     }
+
+    targetHealth.logReadable = true;
+    targetHealth.logError = '';
+    targetHealth.lastLogModifiedAt = stats.mtime.toISOString();
 
     const current = state.get(log.file) || { position: stats.size };
 
@@ -965,9 +1158,17 @@ config.logs.forEach(log => {
 
   try {
     const stats = fs.statSync(log.file);
+    const targetHealth = serverHealth(log);
+    targetHealth.logReadable = true;
+    targetHealth.lastLogCheckAt = new Date().toISOString();
+    targetHealth.lastLogModifiedAt = stats.mtime.toISOString();
     state.set(log.file, { position: stats.size });
     console.log(`[AC-WATCH] Watching ${log.name}: ${log.file}`);
   } catch (err) {
+    const targetHealth = serverHealth(log);
+    targetHealth.logReadable = false;
+    targetHealth.logError = err.message;
+    targetHealth.lastLogCheckAt = new Date().toISOString();
     state.set(log.file, { position: 0 });
     console.error(`[AC-WATCH] ${log.file} is not readable yet: ${err.message}`);
   }
@@ -976,3 +1177,6 @@ config.logs.forEach(log => {
 setInterval(() => {
   config.logs.forEach(readNew);
 }, 1000);
+
+writeHealthState();
+setInterval(writeHealthState, 15000);

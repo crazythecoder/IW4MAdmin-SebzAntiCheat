@@ -1,0 +1,55 @@
+name: Publish anti-cheat release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          test "$tag_version" = "$file_version"
+
+      - name: Build release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip -r iw4x-anticheat-release.zip \
+            VERSION README.md \
+            anticheat-discord-config.example.json \
+            anticheat-discord-watcher.js \
+            iw4m-client-map.py \
+            maps iw4madmin updater systemd
+          sha256sum iw4x-anticheat-release.zip > iw4x-anticheat-release.zip.sha256
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              iw4x-anticheat-release.zip \
+              iw4x-anticheat-release.zip.sha256 \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              iw4x-anticheat-release.zip \
+              iw4x-anticheat-release.zip.sha256 \
+              --generate-notes \
+              --title "IW4X Anti-Cheat $GITHUB_REF_NAME"
+          fi
