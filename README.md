@@ -192,6 +192,14 @@ Visible dashboard cases generally require at least one of:
 This is intentional. It keeps the panel from filling with low-confidence trace
 quirks, lucky wallbangs, normal pre-aims, and other weak signals.
 
+Buffered patterns do not become review cases from repeated reason text alone.
+They need structured gameplay context (such as distance, angle, line of sight,
+visibility time, or hit location), multiple independent targets, or report
+support. Aggregated patterns receive their repetition bonus once; case scoring
+does not add the same source events a second time. Patterns with incomplete
+structured telemetry are capped below normal review confidence and remain in
+the evidence log for future correlation instead of filling the queue.
+
 The IW4MAdmin plugin listens for `ClientPenaltyAdministered` events whose
 penalty type is `Report`. IW4MAdmin emits this canonical event after
 `!report <player> <reason>` succeeds, with the reported player as the offender,
@@ -205,6 +213,8 @@ Legacy report records whose GUID is `Unknown` are merged into a matching
 resolved-GUID case when player/server/client or profile aliases identify one
 unambiguous player. If an alias could refer to multiple GUIDs, it is left
 separate rather than risking an incorrect merge.
+Server aliases are color-code insensitive, allowing a report recorded under a
+plain IW4MAdmin hostname to join telemetry recorded under the colored hostname.
 
 If duplicate cases appear where one says `GUID Unknown` and another has a real
 GUID, restart IW4MAdmin and make sure the client map helper/watcher is running.

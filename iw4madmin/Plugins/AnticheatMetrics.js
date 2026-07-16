@@ -9,7 +9,7 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
 
 const plugin = {
     author: 'Local',
-    version: '1.0.3',
+    version: '1.0.4',
     name: 'Anticheat Metrics',
     logger: null,
     config: null,
@@ -3318,7 +3318,17 @@ const plugin = {
         const end = Date.parse(events[events.length - 1].timestamp || events[events.length - 1].time || '') || start;
         const windowMs = Math.max(1, Number(this.settings.candidateWindowMinutes || 15)) * 60 * 1000;
         const reportSupported = (reportTimes || []).some(at => at > 0 && at >= start - windowMs && at <= end + windowMs);
-        const repeatedSupported = similarCount >= Number(this.settings.candidateMinSimilarEvents || 3) && distinctFamilies >= 2;
+        const structuredTelemetryEvents = events.filter(event => this.hasStructuredTelemetry(event)).length;
+        const uniqueVictims = [];
+        events.forEach(event => {
+            const victim = this.normalizedPlayerName(event.victimName || event.victim || '');
+            if (victim && victim !== 'unknown' && victim !== 'not available' && uniqueVictims.indexOf(victim) === -1) {
+                uniqueVictims.push(victim);
+            }
+        });
+        const hasIndependentContext = structuredTelemetryEvents >= 2 || uniqueVictims.length >= 2;
+        const repeatedSupported = similarCount >= Number(this.settings.candidateMinSimilarEvents || 3) &&
+            distinctFamilies >= 2 && hasIndependentContext;
         const reportPattern = reportSupported && events.some(event => Number(event.riskScore || 0) >= 45 && Number(event.confidenceScore || 0) >= 30);
 
         if (!repeatedSupported && !reportPattern) return null;
@@ -3328,10 +3338,18 @@ const plugin = {
         const maxConfidence = Math.max(...events.map(event => Number(event.confidenceScore || 0)));
         const durationMinutes = Math.max(1, Math.ceil((end - start) / 60000));
         const familyLabel = this.timelineFamilyLabel(dominant);
+        const telemetryLimited = structuredTelemetryEvents < 2;
         const uniqueReasons = [];
         events.forEach(event => (event.rawReasons || event.reasons || []).forEach(reason => {
             if (reason && uniqueReasons.indexOf(reason) === -1 && uniqueReasons.length < 4) uniqueReasons.push(reason);
         }));
+
+        let aggregateRisk = this.clampScore(maxRisk + Math.min(12, Math.max(0, events.length - 1) * 3));
+        let aggregateConfidence = this.clampScore(maxConfidence + Math.min(15, Math.max(0, similarCount - 1) * 4 + Math.max(0, distinctFamilies - 1) * 3 + (reportSupported ? 5 : 0)));
+        if (telemetryLimited) {
+            aggregateRisk = Math.min(aggregateRisk, reportSupported ? 72 : 64);
+            aggregateConfidence = Math.min(aggregateConfidence, reportSupported ? 48 : 39);
+        }
 
         return Object.assign({}, latest, {
             eventId: `pattern:${this.stableHash(`${caseId}|${start}|${end}|${dominant}`)}`,
@@ -3342,10 +3360,10 @@ const plugin = {
             sourceEventCount: events.length,
             aggregated: true,
             rawScore: `${events.length} buffered events`,
-            riskScore: this.clampScore(maxRisk + Math.min(12, Math.max(0, events.length - 1) * 3)),
-            confidenceScore: this.clampScore(maxConfidence + Math.min(15, Math.max(0, similarCount - 1) * 4 + Math.max(0, distinctFamilies - 1) * 3 + (reportSupported ? 5 : 0))),
-            evidenceQuality: 'Aggregated repeated pattern',
-            falsePositiveRisk: distinctFamilies >= 2 || reportSupported ? 'Medium' : 'High',
+            riskScore: aggregateRisk,
+            confidenceScore: aggregateConfidence,
+            evidenceQuality: telemetryLimited ? 'Aggregated pattern; structured telemetry incomplete' : 'Aggregated repeated pattern',
+            falsePositiveRisk: telemetryLimited ? 'High' : (distinctFamilies >= 2 || reportSupported ? 'Medium' : 'High'),
             crossedDiscordAlertRules: false,
             discordStatus: 'evidence_only',
             rawReasons: [
@@ -3357,9 +3375,28 @@ const plugin = {
                 sourceEventCount: events.length,
                 familyCounts: familyCounts,
                 reportSupported: reportSupported,
+                structuredTelemetryEvents: structuredTelemetryEvents,
+                uniqueVictims: uniqueVictims.length,
                 sourceEventIds: events.map(event => event.eventId)
             })
         });
+    },
+
+    hasStructuredTelemetry: function (event) {
+        const values = [
+            event && event.distance,
+            event && event.angle,
+            event && event.lineOfSight,
+            event && event.visibleTime,
+            event && event.hitLocation
+        ];
+        return values.filter(value => this.isKnownTelemetryValue(value)).length >= 2;
+    },
+
+    isKnownTelemetryValue: function (value) {
+        const text = this.clean(value === undefined || value === null ? '' : value).toLowerCase();
+        return !!text && text !== '?' && text !== 'unknown' && text !== 'not recorded' &&
+            text !== 'not available' && text !== 'n/a' && text !== 'null' && text !== 'undefined';
     },
 
     timelineSignalFamily: function (event) {
@@ -3439,17 +3476,26 @@ const plugin = {
 
     caseAliasKeys: function (item) {
         const player = this.normalizedPlayerName(item.playerName || item.player || '');
-        const server = this.clean(item.serverName || item.server || item.serverKey || '').toLowerCase();
         const client = this.identityValue(item.clientId || item.client || '');
         const profile = this.identityValue(item.profileId || '');
         const keys = [];
+        const servers = [];
 
-        if (player && server && client) {
-            keys.push(`player-server-client:${player}|${server}|${client}`);
-        }
-        if (player && server) {
-            keys.push(`player-server:${player}|${server}`);
-        }
+        [item.serverName, item.server, item.serverKey].forEach(value => {
+            const server = this.normalizedServerIdentity(value || '');
+            if (server && servers.indexOf(server) === -1) {
+                servers.push(server);
+            }
+        });
+
+        servers.forEach(server => {
+            if (player && client) {
+                keys.push(`player-server-client:${player}|${server}|${client}`);
+            }
+            if (player) {
+                keys.push(`player-server:${player}|${server}`);
+            }
+        });
         if (profile) {
             keys.push(`profile:${profile}`);
         }
@@ -3564,7 +3610,10 @@ const plugin = {
         const hardAimEvents = events.filter(event => this.isHardDetection(event) || this.isAimLockLikeEvent(event)).length;
         const suspiciousCategories = this.suspiciousCategoryCount(events, reports, hard);
         const evidenceEventCount = events.reduce((sum, event) => sum + Math.max(1, Number(event.sourceEventCount || 1)), 0);
-        const repeatedBonus = Math.min(18, Math.max(0, evidenceEventCount - 1) * 4);
+        // Aggregated patterns already include their source-event repetition bonus.
+        // Count each aggregate once here so the same evidence is not scored twice.
+        const independentScoringEvents = events.reduce((sum, event) => sum + (event.aggregated ? 1 : Math.max(1, Number(event.sourceEventCount || 1))), 0);
+        const repeatedBonus = Math.min(18, Math.max(0, independentScoringEvents - 1) * 4);
         const hardBonus = Math.min(12, hard * 4);
         const reportBonus = Math.min(18, uniqueReporters * 7 + Math.max(0, reports - uniqueReporters) * 3);
         const maxRisk = Math.max(0, ...events.map(event => Number(event.riskScore || 0)));
@@ -5796,6 +5845,10 @@ const plugin = {
     },
 
     normalizedPlayerName: function (value) {
+        return this.stripColors(value).toLowerCase().replace(/\s+/g, ' ').trim();
+    },
+
+    normalizedServerIdentity: function (value) {
         return this.stripColors(value).toLowerCase().replace(/\s+/g, ' ').trim();
     },
 
