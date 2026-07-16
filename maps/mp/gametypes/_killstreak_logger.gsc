@@ -38,7 +38,7 @@ kslog_watchKillstreakEarns()
             }
         }
 
-        wait 0.25;
+        wait 0.50;
     }
 }
 
@@ -155,7 +155,7 @@ kslog_watchNukeCalls()
             }
         }
 
-        wait 0.25;
+        wait 0.50;
     }
 }
 
@@ -179,7 +179,7 @@ kslog_watchCarePackageRewards()
             crate thread kslog_watchCarePackageReward();
         }
 
-        wait 0.25;
+        wait 0.75;
     }
 }
 

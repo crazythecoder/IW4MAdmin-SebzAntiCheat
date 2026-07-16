@@ -9,7 +9,7 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
 
 const plugin = {
     author: 'Local',
-    version: '1.0.4',
+    version: '1.0.5',
     name: 'Anticheat Metrics',
     logger: null,
     config: null,

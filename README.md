@@ -4,6 +4,10 @@ This is a **server-side suspicion and review system** for IW4X / Modern Warfare 
 
 It does **not** automatically ban players. It records suspicious evidence, sends review alerts, and adds an IW4MAdmin web dashboard so staff can decide what needs attention.
 
+Version `1.0.5` reduces continuous GSC workload by caching visibility samples,
+filtering trace candidates by view direction, and skipping bot-attacker monitor
+threads. This performance work does not remove fresh kill-time validation.
+
 ## What It Detects
 
 The GSC script tracks patterns such as:
@@ -82,6 +86,8 @@ set ac_suspicion_alert_cooldown_ms "90000"
 set ac_suspicion_include_bots "0"
 set ac_suspicion_debug "0"
 set ac_suspicion_admin_ids ""
+set ac_suspicion_visibility_sample_ms "200"
+set ac_suspicion_aim_sample_ms "100"
 ```
 
 For testing with bots, temporarily use:
@@ -91,6 +97,14 @@ set ac_suspicion_include_bots "1"
 ```
 
 Restart the server or rotate the map after changing GSC files.
+
+The `200ms` visibility and `100ms` aim sampling defaults are performance-safe
+starting points for populated servers. The script only starts continuous
+aim/visibility monitors for human attackers, traces enemies near the player's
+view direction, and reuses recent visibility results during aim-lock analysis.
+Kill-time evidence still performs a fresh trace. Do not lower visibility below
+`150ms` or aim sampling below `75ms`; the script enforces those minimums to
+protect server frame time.
 
 Important: after replacing the GSC files, restart the IW4X game servers. After
 replacing `AnticheatMetrics.js`, restart IW4MAdmin. If the old watcher or old

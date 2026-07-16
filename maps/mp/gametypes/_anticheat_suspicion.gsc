@@ -44,10 +44,19 @@ init()
     level.acs_alert_cooldown_ms = acs_getDvarIntDefault("ac_suspicion_alert_cooldown_ms", 90000);
     level.acs_decay_interval_ms = 15000;
     level.acs_decay_amount = 5;
-    level.acs_visibility_sample_seconds = 0.10;
-    level.acs_snap_sample_seconds = 0.05;
+    // Continuous traces are the most expensive part of the GSC. These
+    // defaults retain useful pre-kill history without running an all-player
+    // trace scan every frame. Operators can tune them without editing GSC.
+    level.acs_visibility_sample_seconds = acs_getDvarIntDefault("ac_suspicion_visibility_sample_ms", 200) * 0.001;
+    level.acs_snap_sample_seconds = acs_getDvarIntDefault("ac_suspicion_aim_sample_ms", 100) * 0.001;
 
-    acs_debug("loaded threshold=" + level.acs_threshold);
+    if (level.acs_visibility_sample_seconds < 0.15)
+        level.acs_visibility_sample_seconds = 0.15;
+
+    if (level.acs_snap_sample_seconds < 0.075)
+        level.acs_snap_sample_seconds = 0.075;
+
+    acs_debug("loaded threshold=" + level.acs_threshold + " visibility=" + level.acs_visibility_sample_seconds + "s aim=" + level.acs_snap_sample_seconds + "s");
 
     level thread acs_hookPlayerKilledCallback();
     level thread acs_onPlayerConnect();
@@ -128,8 +137,18 @@ acs_setupPlayer()
     self.acs_last_hidden_pursuit_duration = 0;
     self.acs_last_hidden_pursuit_mismatch = 181;
     self.acs_last_hidden_pursuit_distance = 0;
+    self.acs_trace_visible = [];
+    self.acs_trace_sample_time = [];
 
     self thread acs_watchShots();
+
+    // Bot attackers are never scored. Keep only their event-driven shot
+    // tracker so unsuppressed bot fire can still explain a human's radar read.
+    // Avoiding aim/visibility/decay threads for bots removes substantial work
+    // on Bot Warfare servers.
+    if (acs_isBot(self))
+        return;
+
     self thread acs_watchAimSnaps();
     self thread acs_watchSayCommands();
     self thread acs_watchVisibility();
@@ -198,6 +217,12 @@ acs_watchVisibility()
 
     for (;;)
     {
+        if (!isAlive(self))
+        {
+            wait 0.50;
+            continue;
+        }
+
         players = level.players;
         now = getTime();
 
@@ -208,11 +233,49 @@ acs_watchVisibility()
             if (!isDefined(target) || target == self || !isPlayer(target))
                 continue;
 
-            if (!isAlive(self) || !isAlive(target))
+            key = "acs_visible_" + target getEntityNumber();
+
+            if (!isAlive(target) || !self acs_isEnemyTarget(target))
+            {
+                self.acs_trace_visible[key] = false;
+                self.acs_trace_sample_time[key] = now;
+
+                if (isDefined(self.acs_visible_since))
+                    self.acs_visible_since[key] = undefined;
+
+                if (isDefined(self.acs_no_los_preaim_since))
+                    self.acs_no_los_preaim_since[key] = undefined;
+
+                self acs_clearHiddenCrosshair(key);
+                self acs_clearHiddenPursuit(key);
                 continue;
+            }
+
+            dist = int(distance(self.origin, target.origin));
+            mismatch = self acs_yawMismatchTo(target);
+
+            // Hidden-target tracking only uses targets within 35 degrees, and
+            // scripted-lock tracking only needs targets near the crosshair.
+            // Skip the engine trace entirely for irrelevant targets.
+            if (dist < 180 || dist > 7000 || mismatch > 55)
+            {
+                self.acs_trace_visible[key] = false;
+                self.acs_trace_sample_time[key] = now;
+
+                if (isDefined(self.acs_visible_since))
+                    self.acs_visible_since[key] = undefined;
+
+                if (isDefined(self.acs_no_los_preaim_since))
+                    self.acs_no_los_preaim_since[key] = undefined;
+
+                self acs_clearHiddenCrosshair(key);
+                self acs_clearHiddenPursuit(key);
+                continue;
+            }
 
             hasTrace = self acs_hasClearTraceTo(target);
-            key = "acs_visible_" + target getEntityNumber();
+            self.acs_trace_visible[key] = hasTrace;
+            self.acs_trace_sample_time[key] = now;
 
             if (hasTrace)
             {
@@ -1262,7 +1325,9 @@ acs_bestVisibleTargetMismatchForYaw(yaw)
         if (dist < 250 || dist > 4000)
             continue;
 
-        if (!self acs_hasClearTraceTo(target))
+        // Reuse the visibility monitor's recent result. Previously this helper
+        // performed a fresh trace for every target twice per aim sample.
+        if (!self acs_hasRecentClearTraceTo(target, getTime(), 450))
             continue;
 
         mismatch = self acs_yawMismatchToWithYaw(target, yaw);
@@ -1283,6 +1348,22 @@ acs_bestVisibleTargetMismatchForYaw(yaw)
     best["mismatch"] = bestMismatch;
     best["distance"] = bestDistance;
     return best;
+}
+
+acs_hasRecentClearTraceTo(target, now, maxAgeMs)
+{
+    if (!isDefined(target) || !isDefined(self.acs_trace_visible) || !isDefined(self.acs_trace_sample_time))
+        return false;
+
+    key = "acs_visible_" + target getEntityNumber();
+
+    if (!isDefined(self.acs_trace_visible[key]) || !self.acs_trace_visible[key])
+        return false;
+
+    if (!isDefined(self.acs_trace_sample_time[key]))
+        return false;
+
+    return now - self.acs_trace_sample_time[key] <= maxAgeMs;
 }
 
 acs_yawMismatchToWithYaw(target, yaw)
