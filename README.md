@@ -4,9 +4,15 @@ This is a **server-side suspicion and review system** for IW4X / Modern Warfare 
 
 It does **not** automatically ban players. It records suspicious evidence, sends review alerts, and adds an IW4MAdmin web dashboard so staff can decide what needs attention.
 
-Version `1.0.5` reduces continuous GSC workload by caching visibility samples,
+Version `1.0.5` reduced continuous GSC workload by caching visibility samples,
 filtering trace candidates by view direction, and skipping bot-attacker monitor
 threads. This performance work does not remove fresh kill-time validation.
+
+Version `1.0.6` makes Discord paging independent-event based. One kill can no
+longer satisfy repetition merely because it generated several reason phrases.
+Discord normally requires strong events across multiple victims, an exceptional
+hard mechanical event, or repeated meaningful telemetry corroborated by a
+successful IW4MAdmin player report.
 
 ## What It Detects
 
@@ -134,9 +140,11 @@ cp anticheat-discord-config.example.json anticheat-discord-config.json
 Recommended Discord noise controls:
 
 ```json
-"minDiscordScore": 100,
-"minDiscordStrongSignals": 1,
-"minDiscordEvidenceEvents": 2,
+"minDiscordScore": 120,
+"minDiscordStrongEvents": 2,
+"minDiscordEvidenceEvents": 3,
+"minDiscordUniqueVictims": 2,
+"reportEvidenceWindowMs": 1800000,
 "allowIncompleteMetricAlerts": false
 ```
 
@@ -144,6 +152,10 @@ This keeps weak/incomplete review lines in the local anti-cheat log without
 pinging Discord. Alerts with missing distance/angle/visibility metrics should
 not page staff unless you explicitly set `allowIncompleteMetricAlerts` to
 `true`.
+
+Successful IW4MAdmin `!report` penalties are read from the combined evidence
+log and linked by target GUID first. A report increases alert urgency only when
+meaningful telemetry also exists; reports alone never trigger anti-cheat pings.
 
 4. Start it:
 

@@ -23,6 +23,7 @@ const queue = [];
 const MAX_FIELD_LENGTH = 1024;
 const MAX_TIMELINE_EVENTS = 7;
 const HISTORY_WINDOW_MS = 10 * 60 * 1000;
+const DEFAULT_REPORT_WINDOW_MS = 30 * 60 * 1000;
 
 function loadConfig() {
   const raw = fs.readFileSync(configPath, 'utf8');
@@ -44,11 +45,14 @@ function loadConfig() {
     webhookUrl: config.webhookUrl,
     mention: config.mention || '@here',
     cooldownMs: Number(config.cooldownMs || 90000),
-    minDiscordScore: Number(config.minDiscordScore || 100),
-    minDiscordStrongSignals: Number(config.minDiscordStrongSignals || 1),
-    minDiscordEvidenceEvents: Number(config.minDiscordEvidenceEvents || 2),
+    minDiscordScore: Number(config.minDiscordScore || 120),
+    minDiscordStrongEvents: Number(config.minDiscordStrongEvents || 2),
+    minDiscordEvidenceEvents: Number(config.minDiscordEvidenceEvents || 3),
+    minDiscordUniqueVictims: Number(config.minDiscordUniqueVictims || 2),
     allowIncompleteMetricAlerts: config.allowIncompleteMetricAlerts === true,
     acLogFile: config.acLogFile || path.join(__dirname, 'logs', 'anti-cheat-combined.log'),
+    reportLogFile: config.reportLogFile || config.acLogFile || path.join(__dirname, 'logs', 'anti-cheat-combined.log'),
+    reportEvidenceWindowMs: Number(config.reportEvidenceWindowMs || DEFAULT_REPORT_WINDOW_MS),
     healthFile: config.healthFile || path.join(path.dirname(config.acLogFile || path.join(__dirname, 'logs', 'anti-cheat-combined.log')), 'anticheat-health.json'),
     databaseFile: config.databaseFile || '/home/mw2-cluster/base_files/data/iw4madmin/Database/Database.db',
     clientMapFile: config.clientMapFile || '/home/mw2-cluster/base_files/data/iw4madmin/Logs/iw4m-client-map.json',
@@ -225,8 +229,10 @@ function refreshClientMap() {
   });
 }
 
-refreshClientMap();
-setInterval(refreshClientMap, Math.max(10000, config.clientMapRefreshMs));
+if (require.main === module) {
+  refreshClientMap();
+  setInterval(refreshClientMap, Math.max(10000, config.clientMapRefreshMs));
+}
 
 function clean(value) {
   return String(value || '')
@@ -745,21 +751,11 @@ function falsePositiveRisk(event, evidence) {
 
 function shouldSendDiscordAlert(event, evidence) {
   const score = Number(event.score || 0);
-  const strong = strongSignalCount(event, evidence);
-  const signals = signalSummary(event, evidence);
-  const fpRisk = falsePositiveRisk(event, evidence);
-  const evidenceCount = evidence.length || 1;
   const hasMetrics = hasCompleteReviewMetrics(event, evidence);
+  const quality = discordEvidenceQuality(event, evidence);
+  const reports = recentReportsForAlert(event);
 
   if (score < config.minDiscordScore) {
-    return false;
-  }
-
-  if (strong < config.minDiscordStrongSignals && score < 180) {
-    return false;
-  }
-
-  if (evidenceCount < config.minDiscordEvidenceEvents && score < 150) {
     return false;
   }
 
@@ -767,27 +763,210 @@ function shouldSendDiscordAlert(event, evidence) {
     return false;
   }
 
-  if (score >= 180) {
+  // A single exceptional mechanical detection may page staff, but ordinary
+  // wall/LOS wording never qualifies by itself regardless of cumulative score.
+  if (quality.exceptionalHardEvents >= 1 && score >= 140 && quality.falsePositiveRisk !== 'High') {
     return true;
   }
 
-  if (strong >= 2 && score >= 100) {
+  // Normal telemetry requires independent strong kills against distinct
+  // victims. Multiple reason phrases from one kill do not count as repetition.
+  if (quality.strongEvents >= config.minDiscordStrongEvents &&
+      quality.evidenceEvents >= config.minDiscordEvidenceEvents &&
+      quality.uniqueVictims >= config.minDiscordUniqueVictims &&
+      quality.falsePositiveRisk !== 'High') {
     return true;
   }
 
-  if (strong >= 1 && score >= 120 && fpRisk !== 'High') {
+  // A successful IW4MAdmin report corroborates telemetry, but a report alone
+  // is never enough. There must still be strong and repeated game evidence.
+  if (reports.count >= 1 && quality.strongEvents >= 1 &&
+      quality.meaningfulEvents >= 2 && quality.uniqueVictims >= 1 &&
+      score >= 110) {
     return true;
   }
 
-  if (signals.recoil && score >= 90) {
+  if (reports.uniqueReporters >= 2 && quality.meaningfulEvents >= 2 &&
+      quality.strongEvents >= 1 && score >= 100) {
     return true;
   }
 
-  if (score >= 150 && evidenceCount >= 4 && fpRisk !== 'High') {
+  // A larger telemetry-only pattern can qualify even if individual events are
+  // not exceptional, provided it spans several victims and is not noisy LOS.
+  if (score >= 160 && quality.meaningfulEvents >= 4 &&
+      quality.uniqueVictims >= 3 && quality.falsePositiveRisk !== 'High') {
     return true;
   }
 
   return false;
+}
+
+function discordEvidenceQuality(event, evidence) {
+  const events = evidence && evidence.length ? evidence : [event];
+  const uniqueVictims = new Set();
+  let strongEvents = 0;
+  let exceptionalHardEvents = 0;
+  let meaningfulEvents = 0;
+
+  events.forEach(item => {
+    const victim = clean(item.victim).toLowerCase();
+    if (victim && victim !== 'unknown' && victim !== '?') {
+      uniqueVictims.add(victim);
+    }
+
+    if (isExceptionalHardEvent(item)) {
+      exceptionalHardEvents++;
+      strongEvents++;
+      meaningfulEvents++;
+      return;
+    }
+
+    if (isIndependentStrongEvent(item)) {
+      strongEvents++;
+      meaningfulEvents++;
+      return;
+    }
+
+    if (isMeaningfulReviewEvent(item)) {
+      meaningfulEvents++;
+    }
+  });
+
+  return {
+    evidenceEvents: events.length,
+    strongEvents,
+    exceptionalHardEvents,
+    meaningfulEvents,
+    uniqueVictims: uniqueVictims.size,
+    falsePositiveRisk: exceptionalHardEvents >= 1 || (strongEvents >= 2 && uniqueVictims.size >= 2)
+      ? 'Low'
+      : (strongEvents >= 1 && meaningfulEvents >= 2 ? 'Medium' : 'High')
+  };
+}
+
+function isExceptionalHardEvent(event) {
+  const text = String(event.reasons || '');
+  const addedScore = Number(event.addedScore || 0);
+  const hardPattern = /ADS aim stayed tightly locked|ADS aim snapped from off-target|repeated ADS snap-lock|no recoil|recoil anomaly/i.test(text);
+  const reduced = /confidence reduced|could explain|single long-range sniper/i.test(text);
+  return hardPattern && addedScore >= 55 && !reduced;
+}
+
+function isIndependentStrongEvent(event) {
+  const text = String(event.reasons || '');
+  const reduced = /confidence reduced|could explain|recently fired an unsuppressed|single long-range sniper/i.test(text);
+
+  if (reduced) {
+    return false;
+  }
+
+  if (/very large aim snap|repeated sniper snap-kill|sniper head\/neck hit rate is unusually high|killed the target less than 120ms/i.test(text)) {
+    return true;
+  }
+
+  const hiddenDuration = longestReasonDuration(text, /through a wall|hidden target|held crosshair|moved directly toward/i);
+  return hiddenDuration >= 800;
+}
+
+function isMeaningfulReviewEvent(event) {
+  const text = String(event.reasons || '');
+  const addedScore = Number(event.addedScore || 0);
+  const onlyNoisyContext = /poor\/no clear|many kills|short-window accuracy/i.test(text) &&
+    !/snap|lock|through a wall|hidden target|held crosshair|moved directly toward/i.test(text);
+
+  if (onlyNoisyContext || /confidence reduced|could explain/i.test(text)) {
+    return false;
+  }
+
+  return addedScore >= 25 && hasCompleteReviewMetrics(event, [event]);
+}
+
+function longestReasonDuration(text, contextPattern) {
+  let longest = 0;
+  reasonList(text).forEach(reason => {
+    if (!contextPattern.test(reason)) {
+      return;
+    }
+
+    const matches = reason.match(/([0-9]+)ms/ig) || [];
+    matches.forEach(match => {
+      longest = Math.max(longest, Number(match.replace(/ms/i, '')) || 0);
+    });
+  });
+  return longest;
+}
+
+function recentReportsForAlert(event) {
+  const empty = { count: 0, uniqueReporters: 0, reports: [] };
+  const file = config.reportLogFile;
+
+  if (!file) {
+    return empty;
+  }
+
+  try {
+    const stats = fs.statSync(file);
+    const maxBytes = 2 * 1024 * 1024;
+    const start = Math.max(0, stats.size - maxBytes);
+    const length = stats.size - start;
+    const buffer = Buffer.alloc(length);
+    const fd = fs.openSync(file, 'r');
+    fs.readSync(fd, buffer, 0, length, start);
+    fs.closeSync(fd);
+
+    const now = Date.now();
+    const reports = buffer.toString('utf8').split(/={20,}/).map(parsePlayerReportBlock).filter(report => {
+      if (!report || now - report.timestamp > config.reportEvidenceWindowMs) {
+        return false;
+      }
+
+      return reportMatchesAlert(report, event);
+    });
+    const reporters = new Set(reports.map(report => report.reporterGuid || report.reporterName.toLowerCase()).filter(Boolean));
+    return { count: reports.length, uniqueReporters: reporters.size, reports };
+  } catch (_) {
+    return empty;
+  }
+}
+
+function parsePlayerReportBlock(block) {
+  if (!/PLAYER_REPORT/.test(block)) {
+    return null;
+  }
+
+  const header = block.match(/^\s*\[([^\]]+)\]\s+PLAYER_REPORT/im);
+  const player = block.match(/^Player:\s*(.*?)\s*\|\s*GUID:\s*(.*?)\s*\|\s*Client:/im);
+  const server = block.match(/^Server:\s*(.*)$/im);
+  const reporter = block.match(/^Reporter:\s*(.*?)\s*\|\s*GUID:\s*(.*)$/im);
+  const timestamp = header ? Date.parse(header[1]) : NaN;
+
+  if (!player || !Number.isFinite(timestamp)) {
+    return null;
+  }
+
+  return {
+    timestamp,
+    playerName: clean(player[1]),
+    playerGuid: clean(player[2]),
+    serverName: clean(server ? server[1] : ''),
+    reporterName: clean(reporter ? reporter[1] : ''),
+    reporterGuid: clean(reporter ? reporter[2] : '')
+  };
+}
+
+function reportMatchesAlert(report, event) {
+  const eventGuid = clean(event.guid).toLowerCase();
+  const reportGuid = clean(report.playerGuid).toLowerCase();
+  const guidKnown = value => value && value !== 'unknown' && value !== '?';
+
+  if (guidKnown(eventGuid) && guidKnown(reportGuid)) {
+    return eventGuid === reportGuid;
+  }
+
+  const samePlayer = clean(report.playerName).toLowerCase() === clean(event.player).toLowerCase();
+  const eventServer = clean(event.hostname).toLowerCase();
+  const reportServer = clean(report.serverName).toLowerCase();
+  return samePlayer && (!eventServer || !reportServer || eventServer === reportServer);
 }
 
 function hasCompleteReviewMetrics(event, evidence) {
@@ -927,6 +1106,7 @@ function shortRecentActivity(evidence) {
 
 function buildPayload(serverName, event) {
   const evidence = evidenceForAlert(serverName, event);
+  const linkedReports = recentReportsForAlert(event);
   const reason = plainReason(event, evidence);
   const recentActivity = shortRecentActivity(evidence);
   const latestLos = event.hasLos ? 'clear view' : 'poor/no clear view';
@@ -950,6 +1130,14 @@ function buildPayload(serverName, event) {
     { name: 'Recent Activity', value: recentActivity, inline: false },
     { name: 'Server', value: event.hostname || serverName, inline: false }
   ];
+
+  if (linkedReports.count > 0) {
+    fields.splice(fields.length - 1, 0, {
+      name: 'Linked Player Reports',
+      value: `${linkedReports.count} successful IW4MAdmin report${linkedReports.count === 1 ? '' : 's'} from ${linkedReports.uniqueReporters} unique reporter${linkedReports.uniqueReporters === 1 ? '' : 's'}`,
+      inline: false
+    });
+  }
 
   return {
     username: 'IW4x Anti-Cheat',
@@ -1020,13 +1208,15 @@ function sendNow(payload) {
   req.end();
 }
 
-setInterval(() => {
-  if (queue.length === 0) {
-    return;
-  }
+if (require.main === module) {
+  setInterval(() => {
+    if (queue.length === 0) {
+      return;
+    }
 
-  sendNow(queue.shift());
-}, 1200);
+    sendNow(queue.shift());
+  }, 1200);
+}
 
 function processLine(log, line) {
   if (line.includes('InitGame')) {
@@ -1085,9 +1275,11 @@ function processLine(log, line) {
   const evidence = evidenceForAlert(log.name, event);
 
   if (!shouldSendDiscordAlert(event, evidence)) {
+    const quality = discordEvidenceQuality(event, evidence);
+    const reports = recentReportsForAlert(event);
     appendAcOnlyLog(log.name, 'DISCORD_SUPPRESSED', {
       ...event,
-      reasons: `Discord alert suppressed: score crossed threshold, but evidence was mostly weak/noisy. Strong signals=${strongSignalCount(event, evidence)}, weak signals=${weakSignalCount(event, evidence)}, false-positive risk=${falsePositiveRisk(event, evidence)}`
+      reasons: `Discord alert suppressed: score crossed threshold without enough independent corroboration. Strong events=${quality.strongEvents}, meaningful events=${quality.meaningfulEvents}, unique victims=${quality.uniqueVictims}, linked reports=${reports.count}, false-positive risk=${quality.falsePositiveRisk}`
     }, line);
     return;
   }
@@ -1151,32 +1343,42 @@ function readNew(log) {
   });
 }
 
-config.logs.forEach(log => {
-  if (!log.name || !log.file) {
-    return;
-  }
+if (require.main === module) {
+  config.logs.forEach(log => {
+    if (!log.name || !log.file) {
+      return;
+    }
 
-  try {
-    const stats = fs.statSync(log.file);
-    const targetHealth = serverHealth(log);
-    targetHealth.logReadable = true;
-    targetHealth.lastLogCheckAt = new Date().toISOString();
-    targetHealth.lastLogModifiedAt = stats.mtime.toISOString();
-    state.set(log.file, { position: stats.size });
-    console.log(`[AC-WATCH] Watching ${log.name}: ${log.file}`);
-  } catch (err) {
-    const targetHealth = serverHealth(log);
-    targetHealth.logReadable = false;
-    targetHealth.logError = err.message;
-    targetHealth.lastLogCheckAt = new Date().toISOString();
-    state.set(log.file, { position: 0 });
-    console.error(`[AC-WATCH] ${log.file} is not readable yet: ${err.message}`);
-  }
-});
+    try {
+      const stats = fs.statSync(log.file);
+      const targetHealth = serverHealth(log);
+      targetHealth.logReadable = true;
+      targetHealth.lastLogCheckAt = new Date().toISOString();
+      targetHealth.lastLogModifiedAt = stats.mtime.toISOString();
+      state.set(log.file, { position: stats.size });
+      console.log(`[AC-WATCH] Watching ${log.name}: ${log.file}`);
+    } catch (err) {
+      const targetHealth = serverHealth(log);
+      targetHealth.logReadable = false;
+      targetHealth.logError = err.message;
+      targetHealth.lastLogCheckAt = new Date().toISOString();
+      state.set(log.file, { position: 0 });
+      console.error(`[AC-WATCH] ${log.file} is not readable yet: ${err.message}`);
+    }
+  });
 
-setInterval(() => {
-  config.logs.forEach(readNew);
-}, 1000);
+  setInterval(() => {
+    config.logs.forEach(readNew);
+  }, 1000);
 
-writeHealthState();
-setInterval(writeHealthState, 15000);
+  writeHealthState();
+  setInterval(writeHealthState, 15000);
+}
+
+module.exports = {
+  discordEvidenceQuality,
+  parsePlayerReportBlock,
+  recentReportsForAlert,
+  reportMatchesAlert,
+  shouldSendDiscordAlert
+};
