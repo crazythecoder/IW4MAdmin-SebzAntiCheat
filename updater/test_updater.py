@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 import zipfile
+import sys
 from pathlib import Path
 
 
@@ -64,6 +65,50 @@ class UpdaterTests(unittest.TestCase):
                 archive.writestr("../outside.txt", "bad")
             with self.assertRaises(RuntimeError):
                 UPDATER.safe_extract(archive_path, root / "extract")
+
+    def test_initialization_seeds_missing_file_without_overwriting_local_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "package"
+            package.mkdir()
+            (package / "example.json").write_text('{"secret":"placeholder"}\n', encoding="utf-8")
+            destination = root / "config/config.json"
+            config = {
+                "repository": "owner/repository",
+                "stateFile": str(root / "state.json"),
+                "backupDirectory": str(root / "backups"),
+                "targets": {},
+                "initialization": {
+                    "directories": [{"path": str(root / "runtime"), "mode": "750"}],
+                    "seedFiles": [{"source": "example.json", "destination": str(destination), "mode": "640"}],
+                },
+            }
+            config_path = root / "updater.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            updater = UPDATER.Updater(config_path)
+            manifest = {"files": []}
+
+            updater.initialize_directories()
+            updater.initialize_seed_files(package, manifest)
+            self.assertTrue((root / "runtime").is_dir())
+            self.assertIn("placeholder", destination.read_text(encoding="utf-8"))
+
+            destination.write_text('{"secret":"local"}\n', encoding="utf-8")
+            updater.initialize_seed_files(package, manifest)
+            self.assertIn("local", destination.read_text(encoding="utf-8"))
+
+    def test_health_check_can_repair_and_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "healthy"
+            check = [sys.executable, "-c", "import pathlib,sys; sys.exit(0 if pathlib.Path(sys.argv[1]).exists() else 1)", str(marker)]
+            repair = [sys.executable, "-c", "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ok')", str(marker)]
+            UPDATER.run_health_checks([{
+                "name": "test service",
+                "command": check,
+                "attempts": 1,
+                "repairCommands": [repair],
+            }])
+            self.assertTrue(marker.exists())
 
 
 if __name__ == "__main__":

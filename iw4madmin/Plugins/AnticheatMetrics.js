@@ -9,7 +9,7 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
 
 const plugin = {
     author: 'Local',
-    version: '1.0.6',
+    version: '1.0.8',
     name: 'Anticheat Metrics',
     logger: null,
     config: null,
@@ -36,6 +36,8 @@ const plugin = {
         candidateMinSimilarEvents: 3,
         candidateMinRisk: 65,
         candidateMinConfidence: 55,
+        candidateMinUniqueVictims: 2,
+        candidateMinStructuredEvents: 2,
         purgeRetentionDays: 5
     },
 
@@ -92,12 +94,22 @@ const plugin = {
             return;
         }
 
-        if (type !== 'Ban' && type !== 'TempBan') {
+        if (type !== 'Flag' && type !== 'Ban' && type !== 'TempBan') {
             return;
         }
 
         const automatedReason = this.automatedBanReason(penalty, penaltyEvent);
         if (!this.isAutomatedBan(penalty, penaltyEvent, automatedReason)) {
+            return;
+        }
+
+        if (type === 'Flag') {
+            if (!this.isNativeAnticheatDetectionReason(automatedReason)) {
+                return;
+            }
+
+            const event = this.buildNativeFlagEvent(penalty, penaltyEvent, client, automatedReason);
+            this.appendNativeFlagLog(event);
             return;
         }
 
@@ -3110,6 +3122,7 @@ const plugin = {
                     uniqueReporters: 0,
                     reporterIds: [],
                     victimIds: [],
+                    sourceUniqueVictims: 0,
                     alerts: 0,
                     discordAlertCount: 0,
                     actions: 0,
@@ -3121,6 +3134,7 @@ const plugin = {
 
             const group = groups[key];
             group.events.push(item);
+            group.sourceUniqueVictims = Math.max(group.sourceUniqueVictims || 0, Number(item.uniqueVictims || 0));
             group.firstSeen = this.earliestIso(group.firstSeen, item.timestamp);
             group.lastSeen = this.latestIso(group.lastSeen, item.timestamp);
 
@@ -3276,9 +3290,11 @@ const plugin = {
         const risk = Number(event && event.riskScore || 0);
         const confidence = Number(event && event.confidenceScore || 0);
         const highFalsePositiveRisk = String(event && event.falsePositiveRisk || '').toLowerCase() === 'high';
-        return risk >= Number(this.settings.candidateMinRisk || 65) &&
-            confidence >= Number(this.settings.candidateMinConfidence || 55) &&
-            !highFalsePositiveRisk;
+        const softVisibilityOnly = this.isSoftEspOrLosEvent(event) &&
+            !this.isAimLockLikeEvent(event) && !this.hasStrongAimAngle(event);
+        return risk >= Math.max(75, Number(this.settings.candidateMinRisk || 65)) &&
+            confidence >= Math.max(65, Number(this.settings.candidateMinConfidence || 55)) &&
+            this.hasStructuredTelemetry(event) && !softVisibilityOnly && !highFalsePositiveRisk;
     },
 
     timelineCandidateWindows: function (events) {
@@ -3319,6 +3335,14 @@ const plugin = {
         const windowMs = Math.max(1, Number(this.settings.candidateWindowMinutes || 15)) * 60 * 1000;
         const reportSupported = (reportTimes || []).some(at => at > 0 && at >= start - windowMs && at <= end + windowMs);
         const structuredTelemetryEvents = events.filter(event => this.hasStructuredTelemetry(event)).length;
+        const mechanicalAimEvents = events.filter(event => this.isMechanicalAimEvent(event));
+        const mechanicalVictims = [];
+        mechanicalAimEvents.forEach(event => {
+            const victim = this.normalizedPlayerName(event.victimName || event.victim || '');
+            if (victim && victim !== 'unknown' && victim !== 'not available' && mechanicalVictims.indexOf(victim) === -1) {
+                mechanicalVictims.push(victim);
+            }
+        });
         const uniqueVictims = [];
         events.forEach(event => {
             const victim = this.normalizedPlayerName(event.victimName || event.victim || '');
@@ -3326,10 +3350,17 @@ const plugin = {
                 uniqueVictims.push(victim);
             }
         });
-        const hasIndependentContext = structuredTelemetryEvents >= 2 || uniqueVictims.length >= 2;
+        const minimumStructuredEvents = Number(this.settings.candidateMinStructuredEvents || 2);
+        const minimumUniqueVictims = Number(this.settings.candidateMinUniqueVictims || 2);
+        const hasIndependentContext = structuredTelemetryEvents >= minimumStructuredEvents &&
+            uniqueVictims.length >= minimumUniqueVictims;
+        const independentFamilyCount = Object.keys(familyCounts)
+            .filter(family => family !== 'general' && family !== 'kill_pattern').length;
+        const repeatedVisibilityPattern = Number(familyCounts.esp_los || 0) >= 4 && uniqueVictims.length >= 3;
         const repeatedSupported = similarCount >= Number(this.settings.candidateMinSimilarEvents || 3) &&
-            distinctFamilies >= 2 && hasIndependentContext;
-        const reportPattern = reportSupported && events.some(event => Number(event.riskScore || 0) >= 45 && Number(event.confidenceScore || 0) >= 30);
+            hasIndependentContext && (independentFamilyCount >= 2 || repeatedVisibilityPattern);
+        const reportPattern = reportSupported && structuredTelemetryEvents >= 2 && events.length >= 2 &&
+            events.some(event => Number(event.riskScore || 0) >= 55 && Number(event.confidenceScore || 0) >= 40);
 
         if (!repeatedSupported && !reportPattern) return null;
 
@@ -3350,6 +3381,11 @@ const plugin = {
             aggregateRisk = Math.min(aggregateRisk, reportSupported ? 72 : 64);
             aggregateConfidence = Math.min(aggregateConfidence, reportSupported ? 48 : 39);
         }
+        const independentMechanicalPattern = mechanicalAimEvents.length >= 3 && mechanicalVictims.length >= 2;
+        if (!independentMechanicalPattern && !reportSupported) {
+            aggregateRisk = Math.min(aggregateRisk, 79);
+            aggregateConfidence = Math.min(aggregateConfidence, 54);
+        }
 
         return Object.assign({}, latest, {
             eventId: `pattern:${this.stableHash(`${caseId}|${start}|${end}|${dominant}`)}`,
@@ -3358,12 +3394,15 @@ const plugin = {
             eventType: this.timelineFamilyEventType(dominant, latest.eventType),
             subType: 'aggregated_pattern',
             sourceEventCount: events.length,
+            uniqueVictims: uniqueVictims.length,
             aggregated: true,
             rawScore: `${events.length} buffered events`,
             riskScore: aggregateRisk,
             confidenceScore: aggregateConfidence,
             evidenceQuality: telemetryLimited ? 'Aggregated pattern; structured telemetry incomplete' : 'Aggregated repeated pattern',
-            falsePositiveRisk: telemetryLimited ? 'High' : (distinctFamilies >= 2 || reportSupported ? 'Medium' : 'High'),
+            falsePositiveRisk: telemetryLimited || (!independentMechanicalPattern && !reportSupported)
+                ? 'High'
+                : (independentFamilyCount >= 2 || reportSupported ? 'Medium' : 'High'),
             crossedDiscordAlertRules: false,
             discordStatus: 'evidence_only',
             rawReasons: [
@@ -3377,6 +3416,8 @@ const plugin = {
                 reportSupported: reportSupported,
                 structuredTelemetryEvents: structuredTelemetryEvents,
                 uniqueVictims: uniqueVictims.length,
+                mechanicalAimEvents: mechanicalAimEvents.length,
+                mechanicalAimVictims: mechanicalVictims.length,
                 sourceEventIds: events.map(event => event.eventId)
             })
         });
@@ -3463,11 +3504,12 @@ const plugin = {
             return true;
         }
 
-        if (risk >= 60 && confidence >= 45) {
+        if (risk >= 75 && confidence >= 65 && this.hasStructuredTelemetry(group.latest || group)) {
             return true;
         }
 
-        if (events >= 3 && risk >= 60 && confidence >= 45 && (uniqueVictims >= 2 || categories >= 2 || strongAimSupport >= 2)) {
+        if (events >= 3 && risk >= 65 && confidence >= 50 && uniqueVictims >= 2 &&
+            (categories >= 2 || strongAimSupport >= 2)) {
             return true;
         }
 
@@ -3604,7 +3646,7 @@ const plugin = {
         const hard = group.hardDetectionCount || 0;
         const reports = group.reportsCount || group.reports || 0;
         const uniqueReporters = Math.max((group.reporterIds || []).length, group.uniqueReporters || 0, reports > 0 ? 1 : 0);
-        const uniqueVictims = Math.max((group.victimIds || []).length, 0);
+        const uniqueVictims = Math.max((group.victimIds || []).length, Number(group.sourceUniqueVictims || 0), 0);
         const softEspEvents = events.filter(event => this.isSoftEspOrLosEvent(event)).length;
         const strongAngleEvents = events.filter(event => this.hasStrongAimAngle(event)).length;
         const hardAimEvents = events.filter(event => this.isHardDetection(event) || this.isAimLockLikeEvent(event)).length;
@@ -4067,6 +4109,10 @@ const plugin = {
         const text = this.eventText(item);
         const kind = String(item.kind || '').toUpperCase();
 
+        if (kind === 'IW4M_FLAG') {
+            return 'iw4m_hard_detection';
+        }
+
         if (kind === 'AUTO_BAN' || kind === 'AUTO_TEMPBAN' || item.action || item.isAutomatedBan) {
             return 'moderation_action';
         }
@@ -4136,28 +4182,30 @@ const plugin = {
     },
 
     isAimLockLikeEvent: function (item) {
-        const eventType = item && (item.eventType || this.classifyEventType(item));
         const subType = String(item && item.subType || '').toLowerCase();
         const text = this.eventText(item);
-        return eventType === 'aim_suspicion' ||
-            eventType === 'recoil_suspicion' ||
-            subType === 'aim_snap' ||
+        return subType === 'aim_snap' ||
             text.indexOf('aim lock') !== -1 ||
             text.indexOf('aim assist') !== -1 ||
             text.indexOf('silent aim') !== -1 ||
-            text.indexOf('snap') !== -1 ||
+            text.indexOf('snap-lock') !== -1 ||
+            text.indexOf('ads aim stayed tightly') !== -1 ||
+            text.indexOf('ads aim snapped') !== -1 ||
             text.indexOf('quickscope') !== -1 ||
             text.indexOf('sniper head') !== -1 ||
             text.indexOf('no recoil') !== -1;
     },
 
+    isMechanicalAimEvent: function (item) {
+        const text = this.eventText(item);
+        return this.isHardDetection(item) ||
+            /very large aim snap|fast aim snap|snap-lock|ads aim stayed tightly|ads aim snapped|near-perfect aim|no recoil|recoil anomaly/i.test(text);
+    },
+
     hasStrongAimAngle: function (item) {
         const angle = this.numericScore(item && item.angle);
         const text = this.eventText(item);
-        return angle >= 25 ||
-            text.indexOf('large aim angle') !== -1 ||
-            text.indexOf('crosshair was far') !== -1 ||
-            text.indexOf('angle mismatch') !== -1 && angle >= 25;
+        return this.isMechanicalAimEvent(item) && angle >= 25;
     },
 
     suspiciousCategoryCount: function (events, reports, hard) {
@@ -4210,7 +4258,9 @@ const plugin = {
             text.indexOf('quickscope sniper kills') !== -1 ||
             text.indexOf('sniper head/neck hit rate') !== -1;
 
-        let risk = raw;
+        // GSC log scores are cumulative. They must not become per-event risk,
+        // otherwise ordinary repeated play eventually forces every event to 100.
+        let risk = hard ? raw : Math.min(raw, 50);
         let confidence = 35;
 
         if (eventType === 'moderation_action') {
@@ -5022,16 +5072,24 @@ const plugin = {
         const text = this.eventText(item);
         const kind = String(item && item.kind || '').toUpperCase();
 
-        if (kind === 'AUTO_BAN' || kind === 'AUTO_TEMPBAN' || item && item.isAutomatedBan) {
+        if (kind === 'IW4M_FLAG' || kind === 'AUTO_BAN' || kind === 'AUTO_TEMPBAN' || item && item.isAutomatedBan) {
             return true;
         }
 
         return text.indexOf('iw4madmin') !== -1 ||
             text.indexOf('automated') !== -1 ||
-            text.indexOf('bone') !== -1 ||
-            text.indexOf('recoil') !== -1 ||
             text.indexOf('hard anti-cheat') !== -1 ||
             text.indexOf('hard detection') !== -1;
+    },
+
+    isNativeAnticheatDetectionReason: function (reason) {
+        const text = this.clean(reason || '').toLowerCase();
+        if (!text || text.indexOf('marked as "watch"') !== -1 || text.indexOf('anticheat panel') !== -1) {
+            return false;
+        }
+
+        return /^(bone|chest|offset|strain|recoil|snap|button)-/.test(text) ||
+            /\b(bone|chest|offset|strain|recoil|snap|button)\b.*@\d+/.test(text);
     },
 
     itemLooksLikeReport: function (item) {
@@ -5526,6 +5584,63 @@ const plugin = {
         };
     },
 
+    buildNativeFlagEvent: function (penalty, penaltyEvent, client, automatedReason) {
+        const server = client.currentServer || penaltyEvent.server || penaltyEvent.Server || {};
+        const reason = this.clean(automatedReason || penalty.offense || penalty.Offense || 'Native anti-cheat threshold crossed');
+        const detector = (reason.match(/^(bone|chest|offset|strain|recoil|snap|button)/i) || [])[1] || 'Native';
+        const host = this.stripColors(server.hostname || server.Hostname || server.serverName || server.ServerName || server.id || 'Unknown server');
+
+        return {
+            time: new Date().toISOString(),
+            kind: 'IW4M_FLAG',
+            player: this.playerName(client),
+            guid: this.clean(client.networkId || client.NetworkId || client.guid || client.GUID || ''),
+            client: this.clean(client.clientNumber || client.ClientNumber || client.clientId || client.ClientId || ''),
+            profileId: this.clean(client.clientId || client.ClientId || ''),
+            server: host,
+            map: this.clean((server.map && (server.map.name || server.map.alias)) || server.mapName || server.MapName || 'Unknown'),
+            probability: 'High confidence',
+            cheatType: `IW4MAdmin native ${detector} detection`,
+            score: '85',
+            victim: '',
+            weapon: 'N/A',
+            hitLocation: 'N/A',
+            lineOfSight: 'N/A',
+            distance: 'N/A',
+            angle: 'N/A',
+            visibleTime: 'N/A',
+            falsePositiveRisk: 'Low',
+            reason: reason
+        };
+    },
+
+    appendNativeFlagLog: function (event) {
+        const io = importNamespace('System.IO');
+        const path = String(this.settings.logPath || '/app/Logs/anti-cheat-combined.log');
+        const directory = io.Path.GetDirectoryName(path);
+        if (directory && !io.Directory.Exists(directory)) {
+            io.Directory.CreateDirectory(directory);
+        }
+
+        const block = [
+            '============================================================',
+            `[${event.time}] ${event.kind} | IW4MAdmin`,
+            `Player: ${event.player || 'Unknown'} | GUID: ${event.guid || 'Unknown'} | Client: ${event.client || '?'}`,
+            `Profile: ${event.profileId || 'Unknown'}`,
+            `Server: ${event.server || 'Unknown'}`,
+            `Map: ${event.map || 'Unknown'}`,
+            `Suspicion: ${event.score} | Probability: ${event.probability} | Type: ${event.cheatType}`,
+            'Evidence Quality: native IW4MAdmin threshold | false-positive risk=Low',
+            `Reason: ${event.reason}`,
+            'What looked suspicious:',
+            '  - IW4MAdmin native anti-cheat issued a Flag after its configured sample threshold was crossed',
+            `  - ${event.reason}`,
+            ''
+        ].join('\n');
+
+        io.File.AppendAllText(path, `${block}\n`);
+    },
+
     appendAutomatedBanLog: function (event) {
         const io = importNamespace('System.IO');
         const path = String(this.settings.logPath || '/app/Logs/anti-cheat-combined.log');
@@ -5883,3 +5998,7 @@ const plugin = {
             .replace(/'/g, '&#39;');
     }
 };
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = plugin;
+}

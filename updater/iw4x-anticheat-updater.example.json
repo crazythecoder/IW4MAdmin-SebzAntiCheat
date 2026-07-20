@@ -2,6 +2,20 @@
   "repository": "crazythecoder/IW4MAdmin-SebzAntiCheat",
   "stateFile": "/var/lib/iw4x-anticheat-updater/state.json",
   "backupDirectory": "/var/lib/iw4x-anticheat-updater/backups",
+  "initialization": {
+    "directories": [
+      {"path": "/opt/iw4x-anticheat", "mode": "750"},
+      {"path": "/var/lib/iw4x-anticheat-updater/backups", "mode": "750"}
+    ],
+    "seedFiles": [
+      {
+        "source": "anticheat-discord-config.example.json",
+        "destination": "/opt/iw4x-anticheat/anticheat-discord-config.json.example",
+        "mode": "640"
+      }
+    ],
+    "commands": []
+  },
   "autoApply": {
     "updater": true,
     "dashboard": true,
@@ -52,5 +66,27 @@
     "helpers": [],
     "gsc": []
   },
-  "healthCheckCommands": []
+  "validationCommands": [
+    ["node", "--check", "/path/to/IW4MAdmin/Plugins/AnticheatMetrics.js"],
+    ["node", "--check", "/opt/iw4x-anticheat/anticheat-discord-watcher.js"]
+  ],
+  "maintenanceCommands": [],
+  "healthCheckCommands": [],
+  "healthChecks": [
+    {
+      "name": "IW4MAdmin container health",
+      "command": ["docker", "inspect", "--format={{.State.Health.Status}}", "iw4madmin"],
+      "expectedOutput": "^healthy$",
+      "attempts": 6,
+      "delaySeconds": 10,
+      "repairCommands": [["docker", "restart", "iw4madmin"]]
+    },
+    {
+      "name": "Anti-cheat watcher service",
+      "command": ["systemctl", "is-active", "--quiet", "anticheat-discord-watcher"],
+      "attempts": 3,
+      "delaySeconds": 5,
+      "repairCommands": [["systemctl", "restart", "anticheat-discord-watcher"]]
+    }
+  ]
 }

@@ -290,6 +290,28 @@ The default example configuration automatically applies updater, dashboard,
 and helper updates. GSC updates are left pending by default because activating
 them needs an IW4X map rotation or server restart and may disconnect players.
 
+The updater can also initialize and self-check an installation declaratively:
+
+- `initialization.directories` creates required runtime, log, and backup folders.
+- `initialization.seedFiles` copies example/default files only when the local
+  destination does not exist. Existing webhook configuration and secrets are
+  never overwritten.
+- `initialization.commands` performs site-specific one-time/idempotent setup.
+- `validationCommands` validates deployed JavaScript or other files before any
+  service restart. A failure restores the pre-update backup.
+- `healthChecks` supports multiple attempts, an optional `expectedOutput`
+  regular expression, and `repairCommands`. A failed check can restart its
+  affected service once and retry; continued failure rolls the release back.
+- `maintenanceCommands` and health checks also run when files are already
+  current, allowing the two-hour timer to repair configured services without
+  downloading another release.
+
+Initialization is intentionally config-driven. The updater does not guess
+container names, server paths, webhook secrets, or which live IW4X servers may
+be restarted. Put only safe, idempotent commands in these sections. Keep GSC
+automatic application disabled on populated servers unless map rotations or
+disconnects are acceptable.
+
 ### Install the updater
 
 From a downloaded release or repository checkout:
@@ -317,6 +339,15 @@ Test the configuration before enabling automatic checks:
 sudo /opt/iw4x-anticheat-updater/anticheat-updater.py --check
 sudo systemctl enable --now iw4x-anticheat-updater.timer
 systemctl list-timers iw4x-anticheat-updater.timer
+```
+
+Before enabling it, replace every `/path/to/...` placeholder in the example.
+Run one manual update and inspect both the updater state and service health:
+
+```bash
+sudo systemctl start iw4x-anticheat-updater.service
+sudo systemctl status iw4x-anticheat-updater.service --no-pager
+sudo cat /var/lib/iw4x-anticheat-updater/state.json
 ```
 
 Useful commands:
@@ -429,5 +460,31 @@ That is **not a ban-worthy record by itself**. It means the event looked suspici
 ## Notes
 
 - IW4MAdmin native anti-cheat snapshot fields are displayed in raw/debug details if present.
+
+### Native IW4MAdmin detections and evidence promotion
+
+Version 1.0.8 imports native IW4MAdmin `Flag` penalties for the `Snap`,
+`Strain`, `Offset`, `Recoil`, `Bone`, `Chest`, and `Button` detectors as hard
+detections. These are logged when IW4MAdmin itself crosses its configured
+sample threshold; individual native hits are not copied into the review queue.
+Flags created by the Anticheat Panel's Watch action are explicitly excluded.
+
+Custom GSC evidence uses a 15-minute candidate buffer. A normal soft pattern
+must contain at least three similar events, structured metrics from at least two
+events, two distinct signal families, and at least two victims before it is
+promoted. One isolated LOS trace or repeated evidence against only one victim
+stays out of the visible queue. A successful player report can support earlier
+promotion, but still requires at least two meaningful telemetry events.
+
+This makes native detector output the strongest evidence while preserving the
+custom system as supporting context. It does not enable automatic permanent
+bans.
+
+Version 1.0.8 also prevents cumulative GSC scores from being reused as the risk
+of every individual event. Generic `aim_suspicion` and LOS labels from one kill
+no longer count as independent evidence by themselves. Visibility-only patterns
+remain Monitoring with high false-positive risk unless at least three explicit
+mechanical aim events span multiple victims, a player report corroborates the
+telemetry, or IW4MAdmin produces a native hard detection.
 - If the IW4MAdmin database has no `EFACSnapshot` rows, fields like `CapturedViewAngles`, `CurrentStrain`, `RecoilOffset`, and `SessionAverageSnapValue` will show as `Not recorded`.
 - This system should support human review, not replace it.

@@ -11,6 +11,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import re
 import urllib.error
 import urllib.request
 import zipfile
@@ -95,6 +97,39 @@ def run_commands(commands, label):
         subprocess.run([str(part) for part in command], check=True)
 
 
+def run_health_checks(checks):
+    for check in checks or []:
+        name = str(check.get("name") or "health check")
+        command = check.get("command")
+        repair_commands = check.get("repairCommands", [])
+        expected_output = check.get("expectedOutput")
+        attempts = max(1, int(check.get("attempts", 3)))
+        delay = max(0, float(check.get("delaySeconds", 5)))
+        if not isinstance(command, list) or not command:
+            raise RuntimeError("{} command must be a non-empty JSON array".format(name))
+
+        def attempt_check():
+            for attempt in range(1, attempts + 1):
+                print("Running {} ({}/{})".format(name, attempt, attempts))
+                result = subprocess.run([str(part) for part in command], check=False, capture_output=True, text=True)
+                output_matches = expected_output is None or re.search(str(expected_output), result.stdout.strip(), re.IGNORECASE)
+                if result.returncode == 0 and output_matches:
+                    return True
+                if result.stderr.strip():
+                    print(result.stderr.strip(), file=sys.stderr)
+                if attempt < attempts and delay:
+                    time.sleep(delay)
+            return False
+
+        if attempt_check():
+            continue
+        if repair_commands:
+            run_commands(repair_commands, name + " repair")
+            if attempt_check():
+                continue
+        raise RuntimeError("{} failed after {} attempts".format(name, attempts))
+
+
 class Updater:
     def __init__(self, config_path, apply_all=False, force=False):
         self.config_path = Path(config_path)
@@ -104,6 +139,50 @@ class Updater:
         self.apply_all = apply_all
         self.force = force
         self.state = self.load_state()
+        self.validate_configuration()
+
+    def validate_configuration(self):
+        repository = str(self.config.get("repository") or "")
+        if "/" not in repository:
+            raise RuntimeError("repository must use the owner/name format")
+        for component, targets in self.config.get("targets", {}).items():
+            if not isinstance(targets, list):
+                raise RuntimeError("targets.{} must be a JSON array".format(component))
+            for target in targets:
+                if not target.get("source") or not target.get("destination"):
+                    raise RuntimeError("Each {} target needs source and destination".format(component))
+
+    def initialize_directories(self):
+        for entry in self.config.get("initialization", {}).get("directories", []):
+            path = Path(entry["path"])
+            path.mkdir(parents=True, exist_ok=True)
+            if entry.get("mode"):
+                os.chmod(path, int(str(entry["mode"]), 8))
+
+    def initialize_seed_files(self, package_root, manifest):
+        for entry in self.config.get("initialization", {}).get("seedFiles", []):
+            source = package_root / entry["source"]
+            destination = Path(entry["destination"])
+            if destination.exists():
+                continue
+            if not source.is_file():
+                raise RuntimeError("Initialization seed file is missing: {}".format(entry["source"]))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as handle:
+                temp_path = Path(handle.name)
+            shutil.copyfile(source, temp_path)
+            os.chmod(temp_path, int(str(entry.get("mode", "640")), 8))
+            os.replace(temp_path, destination)
+            manifest["files"].append({
+                "component": "initialization",
+                "destination": str(destination),
+                "existed": False,
+                "backup": None,
+            })
+
+    def run_operational_checks(self):
+        run_commands(self.config.get("healthCheckCommands", []), "health check")
+        run_health_checks(self.config.get("healthChecks", []))
 
     def load_state(self):
         if not self.state_path.exists():
@@ -168,6 +247,9 @@ class Updater:
         changed_components = []
 
         try:
+            self.initialize_directories()
+            self.initialize_seed_files(package_root, manifest)
+            run_commands(self.config.get("initialization", {}).get("commands", []), "initialization")
             for component in components:
                 targets = self.config.get("targets", {}).get(component, [])
                 for index, target in enumerate(targets):
@@ -199,9 +281,10 @@ class Updater:
                 changed_components.append(component)
 
             write_json_atomic(backup_dir / "manifest.json", manifest)
+            run_commands(self.config.get("validationCommands", []), "validation")
             for component in changed_components:
                 run_commands(self.config.get("restartCommands", {}).get(component, []), component)
-            run_commands(self.config.get("healthCheckCommands", []), "health check")
+            self.run_operational_checks()
         except Exception:
             print("Update failed; restoring files from {}".format(backup_dir), file=sys.stderr)
             self.restore_manifest(manifest)
@@ -247,10 +330,14 @@ class Updater:
         print("Restored backup {}".format(backup_name))
 
     def apply(self, check_only=False):
+        self.initialize_directories()
         release, version, token = self.check_release()
         pending = self.pending_components(version)
         if not pending:
             print("Anti-cheat components are current at release v{}".format(version))
+            if not check_only:
+                run_commands(self.config.get("maintenanceCommands", []), "maintenance")
+                self.run_operational_checks()
             return
         print("Release v{} is available for: {}".format(version, ", ".join(pending)))
         if check_only:
@@ -279,6 +366,7 @@ def main():
     parser.add_argument("--rollback", action="store_true", help="restore the most recent backup")
     args = parser.parse_args()
 
+    updater = None
     try:
         updater = Updater(args.config, apply_all=args.apply_all, force=args.force)
         if args.rollback:
@@ -286,6 +374,13 @@ def main():
         else:
             updater.apply(check_only=args.check)
     except (KeyError, OSError, RuntimeError, ValueError, urllib.error.URLError, subprocess.CalledProcessError) as error:
+        if updater is not None:
+            updater.state["lastFailure"] = utc_now()
+            updater.state["lastError"] = str(error)
+            try:
+                updater.save_state()
+            except OSError:
+                pass
         print("Anti-cheat updater error: {}".format(error), file=sys.stderr)
         return 1
     return 0
