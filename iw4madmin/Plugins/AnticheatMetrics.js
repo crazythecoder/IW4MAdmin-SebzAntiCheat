@@ -9,18 +9,20 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
 
 const plugin = {
     author: 'Local',
-    version: '1.0.8',
+    version: '1.0.9',
     name: 'Anticheat Metrics',
     logger: null,
     config: null,
     helper: null,
     manager: null,
     recentReportEvents: {},
+    eventCache: null,
     settings: {
         logPath: '/app/Logs/anti-cheat-combined.log',
         healthPath: '/app/Logs/anticheat-health.json',
         healthStaleSeconds: 420,
         maxItems: 300,
+        dashboardLogTailBytes: 2097152,
         sendDiscordForAutomatedBans: true,
         webhookUrl: '',
         cwsSettingsPath: '/app/Configuration/cws/Settings.json',
@@ -77,6 +79,7 @@ const plugin = {
 
         this.logger.logInformation('{Name} v{Version} loaded. LogPath={LogPath}', this.name, this.version, this.settings.logPath);
         this.recentReportEvents = {};
+        this.eventCache = null;
         this.finalizeExpiredPurges();
     },
 
@@ -203,12 +206,12 @@ const plugin = {
                     </div>
                 </header>
                 <section class="ac-metrics-strip">
-                    ${this.statCard('Needs Review', stats.needsReview, 'Check soon.', 'orange')}
-                    ${this.statCard('High Priority', stats.highPriority, 'Strong signals.', 'red')}
-                    ${this.statCard('Monitoring', stats.monitoring, 'Anticheat is watching.', 'blue')}
-                    ${this.statCard('Reports Today', stats.reportsToday, stats.reportsToday > 0 ? 'Linked today.' : 'No reports linked today.', 'slate')}
-                    ${this.statCard('Stale Telemetry', stats.staleTelemetry, stats.staleTelemetry > 0 ? 'Needs attention.' : 'Healthy.', stats.staleTelemetry > 0 ? 'orange' : 'green')}
-                    ${this.statCard('Actions Taken', stats.actionsTaken, 'Already logged.', 'green')}
+                    ${this.statCard('Needs Review', stats.needsReview, 'Check soon.', 'orange', 'needs-review')}
+                    ${this.statCard('High Priority', stats.highPriority, 'Strong signals.', 'red', 'high-priority')}
+                    ${this.statCard('Monitoring', stats.monitoring, 'Anticheat is watching.', 'blue', 'monitoring')}
+                    ${this.statCard('Reports Today', stats.reportsToday, stats.reportsToday > 0 ? 'Linked today.' : 'No reports linked today.', 'slate', 'reports')}
+                    ${this.statCard('Stale Telemetry', stats.staleTelemetry, stats.staleTelemetry > 0 ? 'Needs attention.' : 'Healthy.', stats.staleTelemetry > 0 ? 'orange' : 'green', 'stale')}
+                    ${this.statCard('Actions Taken', stats.actionsTaken, 'Already logged.', 'green', 'actioned')}
                 </section>
                 <section class="ac-queue">
                     <div class="ac-toolbar">
@@ -225,6 +228,8 @@ const plugin = {
                                         <option value="high-priority">High Priority</option>
                                         <option value="monitoring">Monitoring</option>
                                         <option value="watching">Watching</option>
+                                        <option value="stale">Stale Telemetry</option>
+                                        <option value="actioned">Actions Taken</option>
                                         <option value="purged">Purged</option>
                                         <option value="hard">Hard Detections</option>
                                         <option value="soft">Soft Suspicion</option>
@@ -365,12 +370,16 @@ const plugin = {
                             const kind = card.getAttribute('data-kind') || '';
                             const reports = Number(card.getAttribute('data-reports') || '0');
                             const hard = card.getAttribute('data-hard') === 'true';
+                            const stale = card.getAttribute('data-stale') === 'true';
+                            const actions = Number(card.getAttribute('data-actions') || '0');
                             let visible = status !== 'Purged';
 
                             if (filter.value === 'needs-review') visible = status === 'Needs Review';
                             else if (filter.value === 'high-priority') visible = status === 'High Priority';
                             else if (filter.value === 'monitoring') visible = status === 'Monitoring';
                             else if (filter.value === 'watching') visible = status === 'Watching';
+                            else if (filter.value === 'stale') visible = status !== 'Purged' && stale;
+                            else if (filter.value === 'actioned') visible = status !== 'Purged' && actions > 0;
                             else if (filter.value === 'purged') visible = status === 'Purged';
                             else if (filter.value === 'hard') visible = status !== 'Purged' && hard;
                             else if (filter.value === 'soft') visible = status !== 'Purged' && !hard && kind !== 'AUTO_BAN' && kind !== 'AUTO_TEMPBAN';
@@ -429,6 +438,15 @@ const plugin = {
                         const sort = document.getElementById('ac-sort');
                         const refresh = document.getElementById('ac-refresh-now');
                         const auto = document.getElementById('ac-auto-toggle');
+
+                        document.querySelectorAll('#anticheat-metrics-panel [data-ac-stat-filter]').forEach(card => {
+                            card.addEventListener('click', () => {
+                                const selected = card.getAttribute('data-ac-stat-filter') || 'all';
+                                saveState({ filter: selected, sort: 'recent' });
+                                applyControls();
+                                document.querySelector('.ac-queue')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                            });
+                        });
 
                         filter?.addEventListener('change', () => {
                             saveState({ filter: filter.value });
@@ -601,14 +619,18 @@ const plugin = {
             </div>`;
     },
 
-    statCard: function (label, value, subtitle, tone) {
+    statCard: function (label, value, subtitle, tone, filter) {
         const toneClass = tone || 'muted';
         return `
-            <div class="ac-stat ac-tone-${this.escape(toneClass)}">
+            <button type="button"
+                    class="ac-stat ac-tone-${this.escape(toneClass)}"
+                    data-ac-stat-filter="${this.escape(filter || 'all')}"
+                    title="Show ${this.escape(label)} cases, most recent first"
+                    aria-label="Show ${this.escape(label)} cases, most recent first">
                 <div class="ac-stat-label">${this.escape(label)}</div>
                 <div class="ac-stat-value">${this.escape(value)}</div>
                 <div class="ac-stat-desc">${this.escape(subtitle || '')}</div>
-            </div>`;
+            </button>`;
     },
 
     readSystemHealth: function () {
@@ -813,6 +835,8 @@ const plugin = {
                  data-risk="${this.escape(risk.score)}"
                  data-confidence="${this.escape(confidence.score)}"
                  data-reports="${this.escape(reports)}"
+                 data-stale="${this.isStaleTelemetry(item) ? 'true' : 'false'}"
+                 data-actions="${this.escape(Number(item.actions || 0) + (item.isAutomatedBan ? 1 : 0))}"
                  data-time="${this.escape(timeValue)}"
                  class="ac-case ac-accent-${this.escape(accent)}">
                 <div class="ac-case-summary">
@@ -912,6 +936,8 @@ const plugin = {
                  data-risk="${this.escape(risk.score)}"
                  data-confidence="${this.escape(confidence.score)}"
                  data-reports="${this.escape(reports)}"
+                 data-stale="false"
+                 data-actions="0"
                  data-time="${this.escape(timeValue)}"
                  class="ac-case ac-accent-green ac-purged-case">
                 <div class="ac-case-summary">
@@ -1514,11 +1540,27 @@ const plugin = {
                     overflow: visible;
                 }
                 #anticheat-metrics-panel .ac-stat {
+                    appearance: none;
+                    width: 100%;
                     min-width: 0;
                     padding: 14px 16px;
                     border: 1px solid var(--ac-line);
                     border-radius: 11px;
                     background: rgba(255,255,255,.018);
+                    color: inherit;
+                    font: inherit;
+                    text-align: left;
+                    cursor: pointer;
+                    transition: border-color .16s ease, background-color .16s ease, transform .16s ease;
+                }
+                #anticheat-metrics-panel .ac-stat:hover {
+                    border-color: var(--ac-line-strong);
+                    background: rgba(255,255,255,.032);
+                    transform: translateY(-1px);
+                }
+                #anticheat-metrics-panel .ac-stat:focus-visible {
+                    outline: 2px solid rgba(142, 179, 220, .65);
+                    outline-offset: 2px;
                 }
                 #anticheat-metrics-panel .ac-metrics-strip .ac-stat.ac-tone-blue {
                     border-color: rgba(91, 156, 255, .68);
@@ -4789,9 +4831,8 @@ const plugin = {
         const reports = Number(item.reportsCount || item.reports || 0);
         const events = Number(item.eventsCount || (item.events || []).length || 0);
         const uniqueVictims = Number(item.uniqueVictims || 0);
-        const categories = Number(item.suspiciousCategories || this.suspiciousCategoryCount(item.events || [], reports, item.hardDetectionCount || 0));
         const softEsp = (item.events || [item]).filter(event => this.isSoftEspOrLosEvent(event)).length > 0;
-        const strongAimSupport = (item.events || [item]).filter(event => this.hasStrongAimAngle(event) || this.isAimLockLikeEvent(event)).length;
+        const mechanicalAimSupport = (item.events || [item]).filter(event => this.isMechanicalAimEvent(event)).length;
         const text = this.eventText(item);
         const highFalsePositiveRisk = String(item.falsePositiveRisk || '').toLowerCase().indexOf('high') !== -1;
         const sniperLike = /barrett|cheytac|intervention|m21|wa2000|dragunov|m40a3|sniper/.test(String(item.weapon || item.weaponReference || item.cheatType || text || '').toLowerCase());
@@ -4806,15 +4847,9 @@ const plugin = {
         const aimLockPattern = this.isAimLockLikeEvent(item) &&
             (text.indexOf('snap-lock') !== -1 || text.indexOf('aim lock') !== -1 || text.indexOf('aim assist') !== -1) &&
             (text.indexOf('many kills') !== -1 || text.indexOf('repeated') !== -1 || text.indexOf('pattern') !== -1);
-        const strongSingleAimLock = text.indexOf('near-perfect aim') !== -1 ||
-            text.indexOf('ads aim stayed tightly locked') !== -1 ||
-            text.indexOf('ads snapped onto a bot') !== -1;
-
         const independentlySupported = hard ||
-            reports > 0 ||
-            uniqueVictims >= 2 ||
-            categories >= 2 ||
-            strongAimSupport >= 2;
+            (reports > 0 && events >= 2) ||
+            (mechanicalAimSupport >= 2 && uniqueVictims >= 2);
 
         if (hard && risk >= 80 && confidence >= 80) {
             return 'High Priority';
@@ -4824,26 +4859,30 @@ const plugin = {
             return 'High Priority';
         }
 
-        if (!softEsp && !highFalsePositiveRisk && risk >= 90 && confidence >= 75 && independentlySupported) {
+        if (!softEsp && !highFalsePositiveRisk && risk >= 90 && confidence >= 75 &&
+            ((mechanicalAimSupport >= 3 && uniqueVictims >= 2) || (reports > 0 && mechanicalAimSupport >= 2))) {
             return 'High Priority';
         }
 
-        if (aimLockPattern && !highFalsePositiveRisk && risk >= 80 && confidence >= 70 && (aimLockEvidenceCount >= 2 || reports > 0 || (strongSingleAimLock && risk >= 88 && confidence >= 78))) {
+        if (aimLockPattern && !highFalsePositiveRisk && risk >= 80 && confidence >= 70 &&
+            ((aimLockEvidenceCount >= 3 && uniqueVictims >= 2) || (reports > 0 && aimLockEvidenceCount >= 2))) {
             return 'High Priority';
         }
 
-        if (softEsp && !highFalsePositiveRisk && independentlySupported && risk >= 90 && confidence >= 65 && (reports > 0 || uniqueVictims >= 2 || strongAimSupport >= 2 || categories >= 3)) {
+        if (softEsp && !highFalsePositiveRisk && independentlySupported && risk >= 90 && confidence >= 70 &&
+            reports > 0 && mechanicalAimSupport >= 2 && uniqueVictims >= 2) {
             if (sniperLike && reports === 0 && (events < 3 || uniqueVictims < 2)) {
                 return 'Needs Review';
             }
             return 'High Priority';
         }
 
-        if (risk >= 75 && confidence >= 55) {
+        if (risk >= 75 && confidence >= 60 &&
+            (hard || (mechanicalAimSupport >= 2 && uniqueVictims >= 2) || (reports > 0 && events >= 2))) {
             return 'Needs Review';
         }
 
-        if (reports > 0 && risk >= 55 && confidence >= 40) {
+        if (reports > 0 && events >= 2 && risk >= 60 && confidence >= 45) {
             return 'Needs Review';
         }
 
@@ -5240,7 +5279,12 @@ const plugin = {
         }
 
         try {
-            const raw = String(io.File.ReadAllText(logPath));
+            const cacheKey = String(io.File.GetLastWriteTimeUtc(logPath).Ticks);
+            if (this.eventCache && this.eventCache.key === cacheKey) {
+                return this.eventCache.items;
+            }
+
+            const raw = this.readLogTail(logPath, Number(this.settings.dashboardLogTailBytes || 2097152));
             const blocks = raw.split('============================================================');
             const items = [];
             const alertIncidents = {};
@@ -5266,10 +5310,29 @@ const plugin = {
                 }
             }
 
+            this.eventCache = { key: cacheKey, items: items };
             return items;
         } catch (ex) {
             this.logger.logWarning('{Name} failed to read anti-cheat log: {Message}', this.name, ex.toString());
             return [];
+        }
+    },
+
+    readLogTail: function (path, maxBytes) {
+        const io = importNamespace('System.IO');
+        const system = importNamespace('System');
+        const text = importNamespace('System.Text');
+        const stream = io.File.Open(path, io.FileMode.Open, io.FileAccess.Read, io.FileShare.ReadWrite);
+
+        try {
+            const length = Number(stream.Length || 0);
+            const count = Math.min(Math.max(65536, Number(maxBytes || 2097152)), length);
+            stream.Seek(Math.max(0, length - count), io.SeekOrigin.Begin);
+            const buffer = system.Array.CreateInstance(system.Byte, count);
+            const read = stream.Read(buffer, 0, count);
+            return String(text.Encoding.UTF8.GetString(buffer, 0, read));
+        } finally {
+            stream.Dispose();
         }
     },
 

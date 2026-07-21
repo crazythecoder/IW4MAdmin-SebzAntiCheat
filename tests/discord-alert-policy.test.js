@@ -51,11 +51,20 @@ const noisySingle = event({
 assert.strictEqual(policy.shouldSendDiscordAlert(noisySingle, [noisySingle]), false, 'short mitigated wall pre-aim must not ping');
 
 const repeated = [
-  event({ victim: 'Victim A', reasons: 'Aimed at this target through a wall before killing them (1100ms)' }),
-  event({ victim: 'Victim B', reasons: 'Held crosshair on this hidden target before killing them (1300ms within 2 degrees)' }),
-  event({ victim: 'Victim B', addedScore: '28', reasons: 'Fast aim snap right before the kill (55 degrees)' })
+  event({ victim: 'Victim A', addedScore: '45', reasons: 'Fast aim snap right before the kill (55 degrees)' }),
+  event({ victim: 'Victim B', addedScore: '48', reasons: 'Very large aim snap right before the kill (72 degrees)' }),
+  event({ victim: 'Victim C', addedScore: '52', reasons: 'ADS aim snapped from off-target before the kill (60 degree correction)' }),
+  event({ victim: 'Victim C', addedScore: '30', reasons: 'Held crosshair on this hidden target before killing them (1300ms within 2 degrees)' })
 ];
-assert.strictEqual(policy.shouldSendDiscordAlert(event({ victim: 'Victim B' }), repeated), true, 'repeated strong multi-victim evidence should ping');
+assert.strictEqual(policy.shouldSendDiscordAlert(event({ victim: 'Victim C', score: '155' }), repeated), true, 'repeated mechanical multi-victim evidence should ping');
+
+const skilledLosPattern = [
+  event({ victim: 'Victim A', addedScore: '40', reasons: 'Aimed at this target through a wall before killing them (1500ms)' }),
+  event({ victim: 'Victim B', addedScore: '42', reasons: 'Held crosshair on this hidden target before killing them (1800ms within 2 degrees)' }),
+  event({ victim: 'Victim C', addedScore: '45', reasons: 'Moved directly toward a hidden target before killing them (2200ms, aim within 3 degrees)' }),
+  event({ victim: 'Victim D', addedScore: '35', reasons: 'Kill happened with poor/no clear view at long range' })
+];
+assert.strictEqual(policy.shouldSendDiscordAlert(event({ score: '220' }), skilledLosPattern), false, 'LOS and hidden-tracking context without mechanical aim must not ping');
 
 const reportTime = new Date().toISOString();
 fs.writeFileSync(reportLog, [
@@ -69,18 +78,23 @@ fs.writeFileSync(reportLog, [
 ].join('\n'));
 
 const reportSupported = [
-  event({ victim: 'Victim A', reasons: 'Aimed at this target through a wall before killing them (1000ms)' }),
-  event({ victim: 'Victim B', addedScore: '30', reasons: 'Fast aim snap right before the kill (55 degrees)' })
+  event({ victim: 'Victim A', addedScore: '45', reasons: 'Fast aim snap right before the kill (55 degrees)' }),
+  event({ victim: 'Victim B', addedScore: '50', reasons: 'Very large aim snap right before the kill (70 degrees)' }),
+  event({ victim: 'Victim B', addedScore: '30', reasons: 'Aimed at this target through a wall before killing them (1000ms)' })
 ];
 assert.strictEqual(policy.recentReportsForAlert(event()).count, 1, 'successful GUID-matched report should attach');
-assert.strictEqual(policy.shouldSendDiscordAlert(event({ score: '125' }), reportSupported), true, 'report plus repeated meaningful telemetry should ping');
+assert.strictEqual(policy.shouldSendDiscordAlert(event({ score: '135' }), reportSupported), true, 'report plus repeated mechanical telemetry should ping');
 assert.strictEqual(policy.shouldSendDiscordAlert(event({ score: '200', reasons: 'Many kills in a short window' }), [event({ addedScore: '5', reasons: 'Many kills in a short window' })]), false, 'report without strong telemetry must not ping');
 
 const exceptional = event({
-  score: '145',
+  score: '155',
   addedScore: '70',
   reasons: 'ADS aim stayed tightly locked on the victim after a sudden correction (900ms lock, 40 degree correction, 1 degree final aim)'
 });
-assert.strictEqual(policy.shouldSendDiscordAlert(exceptional, [exceptional]), true, 'exceptional hard mechanical evidence should ping');
+assert.strictEqual(policy.shouldSendDiscordAlert(exceptional, [exceptional]), false, 'one exceptional event alone should not ping');
+assert.strictEqual(policy.shouldSendDiscordAlert(exceptional, [
+  exceptional,
+  event({ victim: 'Victim B', score: '150', addedScore: '65', reasons: 'ADS aim snapped from off-target before the kill (65 degree correction)' })
+]), true, 'repeated exceptional multi-victim evidence should ping');
 
 console.log('Discord alert policy tests passed.');

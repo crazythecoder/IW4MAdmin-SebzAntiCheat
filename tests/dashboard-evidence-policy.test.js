@@ -74,6 +74,20 @@ assert.ok(rustAggregate.riskScore <= 79 && rustAggregate.confidenceScore <= 54,
 assert.strictEqual(rustAggregate.falsePositiveRisk, 'High');
 assert.strictEqual(rustAggregate.uniqueVictims, 4,
     'an aggregated pattern must preserve its source victim count for case classification');
+assert.strictEqual(plugin.caseStatus({
+    overallRisk: 100,
+    confidence: 65,
+    uniqueVictims: 4,
+    eventsCount: 9,
+    falsePositiveRisk: 'Medium',
+    events: skilledRustPattern,
+    latest: skilledRustPattern[skilledRustPattern.length - 1]
+}), 'Monitoring', 'skilled multi-victim LOS telemetry without repeated mechanical aim must remain monitoring');
+
+const metricCard = plugin.statCard('High Priority', 3, 'Strong signals.', 'red', 'high-priority');
+assert.ok(metricCard.includes('data-ac-stat-filter="high-priority"'),
+    'summary metrics must expose their queue filter');
+assert.ok(metricCard.includes('type="button"'), 'summary metrics must be keyboard-accessible buttons');
 
 const cumulativeEvent = plugin.scoreEvent(event({
     rawScore: '216 total',

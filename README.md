@@ -486,5 +486,19 @@ no longer count as independent evidence by themselves. Visibility-only patterns
 remain Monitoring with high false-positive risk unless at least three explicit
 mechanical aim events span multiple victims, a player report corroborates the
 telemetry, or IW4MAdmin produces a native hard detection.
+
+Version 1.0.9 keeps dashboard loading bounded as the evidence log grows. The
+review queue reads and caches only the newest 2 MiB of the log for its latest
+300 events; the complete append-only log remains available for audit and purge
+recovery. Summary metrics are now clickable queue filters and always select the
+most-recent ordering.
+
+Discord paging is also more selective in 1.0.9. Visibility and line-of-sight
+signals remain supporting evidence, but telemetry-only alerts now require a
+repeated mechanical aim pattern across multiple victims. Report-supported
+alerts still require meaningful gameplay telemetry, and the effective alert
+cooldown is at least ten minutes even when an older config contains a shorter
+value. This keeps skilled or unusual single kills in the review buffer without
+repeatedly paging staff.
 - If the IW4MAdmin database has no `EFACSnapshot` rows, fields like `CapturedViewAngles`, `CurrentStrain`, `RecoilOffset`, and `SessionAverageSnapValue` will show as `Not recorded`.
 - This system should support human review, not replace it.

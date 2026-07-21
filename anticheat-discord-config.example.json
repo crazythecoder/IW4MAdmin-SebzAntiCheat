@@ -1,7 +1,7 @@
 {
   "webhookUrl": "DISCORD_WEBHOOK_URL_HERE",
   "mention": "@here",
-  "cooldownMs": 90000,
+  "cooldownMs": 600000,
   "minDiscordScore": 120,
   "minDiscordStrongEvents": 2,
   "minDiscordEvidenceEvents": 3,

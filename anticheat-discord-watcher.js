@@ -44,7 +44,7 @@ function loadConfig() {
   return {
     webhookUrl: config.webhookUrl,
     mention: config.mention || '@here',
-    cooldownMs: Number(config.cooldownMs || 90000),
+    cooldownMs: Math.max(600000, Number(config.cooldownMs || 600000)),
     minDiscordScore: Number(config.minDiscordScore || 120),
     minDiscordStrongEvents: Number(config.minDiscordStrongEvents || 2),
     minDiscordEvidenceEvents: Number(config.minDiscordEvidenceEvents || 3),
@@ -765,36 +765,41 @@ function shouldSendDiscordAlert(event, evidence) {
 
   // A single exceptional mechanical detection may page staff, but ordinary
   // wall/LOS wording never qualifies by itself regardless of cumulative score.
-  if (quality.exceptionalHardEvents >= 1 && score >= 140 && quality.falsePositiveRisk !== 'High') {
+  if (quality.falsePositiveRisk === 'High') {
+    return false;
+  }
+
+  if (quality.exceptionalHardEvents >= 2 && quality.uniqueVictims >= 2 && score >= 150) {
     return true;
   }
 
   // Normal telemetry requires independent strong kills against distinct
   // victims. Multiple reason phrases from one kill do not count as repetition.
-  if (quality.strongEvents >= config.minDiscordStrongEvents &&
-      quality.evidenceEvents >= config.minDiscordEvidenceEvents &&
-      quality.uniqueVictims >= config.minDiscordUniqueVictims &&
-      quality.falsePositiveRisk !== 'High') {
+  if (quality.mechanicalEvents >= 3 &&
+      quality.strongEvents >= Math.max(3, config.minDiscordStrongEvents) &&
+      quality.evidenceEvents >= Math.max(4, config.minDiscordEvidenceEvents) &&
+      quality.uniqueVictims >= Math.max(3, config.minDiscordUniqueVictims) &&
+      score >= 150) {
     return true;
   }
 
   // A successful IW4MAdmin report corroborates telemetry, but a report alone
   // is never enough. There must still be strong and repeated game evidence.
-  if (reports.count >= 1 && quality.strongEvents >= 1 &&
-      quality.meaningfulEvents >= 2 && quality.uniqueVictims >= 1 &&
-      score >= 110) {
+  if (reports.count >= 1 && quality.mechanicalEvents >= 2 &&
+      quality.strongEvents >= 2 && quality.meaningfulEvents >= 3 &&
+      quality.uniqueVictims >= 2 && score >= 130) {
     return true;
   }
 
-  if (reports.uniqueReporters >= 2 && quality.meaningfulEvents >= 2 &&
-      quality.strongEvents >= 1 && score >= 100) {
+  if (reports.uniqueReporters >= 2 && quality.mechanicalEvents >= 1 &&
+      quality.meaningfulEvents >= 3 && quality.uniqueVictims >= 2 && score >= 120) {
     return true;
   }
 
   // A larger telemetry-only pattern can qualify even if individual events are
   // not exceptional, provided it spans several victims and is not noisy LOS.
-  if (score >= 160 && quality.meaningfulEvents >= 4 &&
-      quality.uniqueVictims >= 3 && quality.falsePositiveRisk !== 'High') {
+  if (score >= 170 && quality.mechanicalEvents >= 3 &&
+      quality.meaningfulEvents >= 5 && quality.uniqueVictims >= 3) {
     return true;
   }
 
@@ -806,6 +811,7 @@ function discordEvidenceQuality(event, evidence) {
   const uniqueVictims = new Set();
   let strongEvents = 0;
   let exceptionalHardEvents = 0;
+  let mechanicalEvents = 0;
   let meaningfulEvents = 0;
 
   events.forEach(item => {
@@ -816,12 +822,16 @@ function discordEvidenceQuality(event, evidence) {
 
     if (isExceptionalHardEvent(item)) {
       exceptionalHardEvents++;
+      mechanicalEvents++;
       strongEvents++;
       meaningfulEvents++;
       return;
     }
 
     if (isIndependentStrongEvent(item)) {
+      if (isMechanicalAimEvent(item)) {
+        mechanicalEvents++;
+      }
       strongEvents++;
       meaningfulEvents++;
       return;
@@ -836,12 +846,23 @@ function discordEvidenceQuality(event, evidence) {
     evidenceEvents: events.length,
     strongEvents,
     exceptionalHardEvents,
+    mechanicalEvents,
     meaningfulEvents,
     uniqueVictims: uniqueVictims.size,
     falsePositiveRisk: exceptionalHardEvents >= 1 || (strongEvents >= 2 && uniqueVictims.size >= 2)
       ? 'Low'
       : (strongEvents >= 1 && meaningfulEvents >= 2 ? 'Medium' : 'High')
   };
+}
+
+function isMechanicalAimEvent(event) {
+  const text = String(event.reasons || '');
+  const reduced = /confidence reduced|could explain|recently fired an unsuppressed|single long-range sniper/i.test(text);
+  if (reduced) {
+    return false;
+  }
+
+  return /ADS aim stayed tightly locked|ADS aim snapped from off-target|repeated ADS snap-lock|very large aim snap|fast aim snap|repeated sniper snap-kill|killed the target less than 120ms|no recoil|recoil anomaly/i.test(text);
 }
 
 function isExceptionalHardEvent(event) {
@@ -854,10 +875,15 @@ function isExceptionalHardEvent(event) {
 
 function isIndependentStrongEvent(event) {
   const text = String(event.reasons || '');
+  const addedScore = Number(event.addedScore || 0);
   const reduced = /confidence reduced|could explain|recently fired an unsuppressed|single long-range sniper/i.test(text);
 
   if (reduced) {
     return false;
+  }
+
+  if (isMechanicalAimEvent(event) && addedScore >= 35) {
+    return true;
   }
 
   if (/very large aim snap|repeated sniper snap-kill|sniper head\/neck hit rate is unusually high|killed the target less than 120ms/i.test(text)) {
@@ -1279,7 +1305,7 @@ function processLine(log, line) {
     const reports = recentReportsForAlert(event);
     appendAcOnlyLog(log.name, 'DISCORD_SUPPRESSED', {
       ...event,
-      reasons: `Discord alert suppressed: score crossed threshold without enough independent corroboration. Strong events=${quality.strongEvents}, meaningful events=${quality.meaningfulEvents}, unique victims=${quality.uniqueVictims}, linked reports=${reports.count}, false-positive risk=${quality.falsePositiveRisk}`
+      reasons: `Discord alert suppressed: score crossed threshold without enough independent corroboration. Mechanical events=${quality.mechanicalEvents}, strong events=${quality.strongEvents}, meaningful events=${quality.meaningfulEvents}, unique victims=${quality.uniqueVictims}, linked reports=${reports.count}, false-positive risk=${quality.falsePositiveRisk}`
     }, line);
     return;
   }
