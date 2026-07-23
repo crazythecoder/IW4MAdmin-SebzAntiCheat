@@ -1,89 +1,36 @@
-# IW4X / IW4MAdmin Anti-Cheat Review System
+# IW4X Anti-Cheat Review System
 
-This is a **server-side suspicion and review system** for IW4X / Modern Warfare 2 dedicated servers.
+Server-side suspicion telemetry and an IW4MAdmin review dashboard for IW4X.
+It groups repeated evidence, links successful `!report` events, and can send
+high-quality cases to Discord. It does **not** automatically ban players.
 
-It does **not** automatically ban players. It records suspicious evidence, sends review alerts, and adds an IW4MAdmin web dashboard so staff can decide what needs attention.
+## Included
 
-Version `1.0.5` reduced continuous GSC workload by caching visibility samples,
-filtering trace candidates by view direction, and skipping bot-attacker monitor
-threads. This performance work does not remove fresh kill-time validation.
+- GSC aim, visibility, radar-context, and repeated-pattern telemetry
+- IW4MAdmin review queue with risk and confidence scored separately
+- Native IW4MAdmin Snap, Strain, Recoil, Bone, Button, and Offset evidence
+- Watch, Clear, Purge/Recover, and Discord review workflows
+- Optional IW4MAdmin Watch flag worker
+- Performance-aware sampling for populated servers
+- Signed release updater with backups, validation, health checks, and rollback
 
-Version `1.0.6` makes Discord paging independent-event based. One kill can no
-longer satisfy repetition merely because it generated several reason phrases.
-Discord normally requires strong events across multiple victims, an exceptional
-hard mechanical event, or repeated meaningful telemetry corroborated by a
-successful IW4MAdmin player report.
+## Install
 
-## What It Detects
-
-The GSC script tracks patterns such as:
-
-- Aim snaps shortly before a kill
-- ADS lock-like aim behavior
-- Hidden crosshair tracking before a kill
-- Aiming at a target through poor/no line of sight
-- Moving directly toward hidden targets
-- Fast kills immediately after visibility
-- Repeated suspicious events across one player
-- Supporting context such as UAV, Counter-UAV, EMP, heartbeat sensor, Ninja, and unsuppressed weapon radar pings
-
-This system treats ESP/wallhack signals as **suspicion**, not proof.
-
-Radar context is handled carefully:
-
-- A team UAV can reduce ESP-style suspicion while it is active.
-- If the UAV is destroyed, the stock game script decrements `level.activeUAVs`, so the reduction stops.
-- Counter-UAV or EMP blocks the UAV/radar explanation.
-- Unsuppressed victim weapon fire can reduce suspicion only when the attacker's radar is not blocked.
-- Heartbeat sensor only explains hidden-target reads if the victim does **not** have Ninja (`specialty_heartbreaker`).
-- A single long-range sniper hidden-target read is reduced because common lanes,
-  wallbangs, and normal pre-aiming can look suspicious server-side. Repeated
-  sniper patterns still matter.
-
-## Files
+1. Copy these files to every IW4X server:
 
 ```text
 maps/mp/gametypes/_anticheat_suspicion.gsc
 maps/mp/gametypes/_killstreak_logger.gsc
-anticheat-discord-watcher.js
-anticheat-discord-config.example.json
-iw4m-client-map.py
-iw4madmin/Plugins/AnticheatMetrics.js
-iw4madmin/Plugins/anticheat_iw4m_flag_worker.py
-systemd/anticheat-iw4m-flag-worker.service
 ```
 
-Python is only used by optional helper scripts:
-
-- `iw4m-client-map.py` generates GUID/profile lookup data for links and victim resolution.
-- `anticheat_iw4m_flag_worker.py` is only for optional IW4MAdmin Watch flag writes.
-
-The core GSC anti-cheat and the IW4MAdmin dashboard plugin do not require Python.
-
-## Install GSC Scripts
-
-Copy these files into the server's `userraw/maps/mp/gametypes/` folder:
-
-```text
-_anticheat_suspicion.gsc
-_killstreak_logger.gsc
-```
-
-Then call them from `userraw/scripts/mp/custom.gsc`:
+2. Add both hooks to the existing `userraw/scripts/mp/custom.gsc` `init()`:
 
 ```c
-init()
-{
-    level thread maps\mp\gametypes\_anticheat_suspicion::init();
-    level thread maps\mp\gametypes\_killstreak_logger::init();
-}
+level thread maps\mp\gametypes\_anticheat_suspicion::init();
+level thread maps\mp\gametypes\_killstreak_logger::init();
 ```
 
-If `custom.gsc` already exists, add only those two `level thread` lines inside its existing `init()`.
-
-## Server Config Dvars
-
-Add these to `server.cfg`:
+3. Add the recommended server DVARs:
 
 ```cfg
 set ac_suspicion_enabled "1"
@@ -91,185 +38,29 @@ set ac_suspicion_threshold "75"
 set ac_suspicion_alert_cooldown_ms "90000"
 set ac_suspicion_include_bots "0"
 set ac_suspicion_debug "0"
-set ac_suspicion_admin_ids ""
 set ac_suspicion_visibility_sample_ms "200"
 set ac_suspicion_aim_sample_ms "100"
 ```
 
-For testing with bots, temporarily use:
+4. Copy `iw4madmin/Plugins/AnticheatMetrics.js` into IW4MAdmin's `Plugins`
+folder.
 
-```cfg
-set ac_suspicion_include_bots "1"
-```
+5. Configure `anticheat-discord-config.json` from the included example, then
+run `anticheat-discord-watcher.js` as a service. The watcher writes normalized
+evidence and health data used by the dashboard.
 
-Restart the server or rotate the map after changing GSC files.
+6. Restart each IW4X server and IW4MAdmin. Confirm the **Anti-cheat > System
+Status** section reports the dashboard, watcher, storage, and server scripts as
+healthy.
 
-The `200ms` visibility and `100ms` aim sampling defaults are performance-safe
-starting points for populated servers. The script only starts continuous
-aim/visibility monitors for human attackers, traces enemies near the player's
-view direction, and reuses recent visibility results during aim-lock analysis.
-Kill-time evidence still performs a fresh trace. Do not lower visibility below
-`150ms` or aim sampling below `75ms`; the script enforces those minimums to
-protect server frame time.
+Keep `ac_suspicion_include_bots "0"` in production. Enable it only for deliberate
+bot testing.
 
-Important: after replacing the GSC files, restart the IW4X game servers. After
-replacing `AnticheatMetrics.js`, restart IW4MAdmin. If the old watcher or old
-plugin stays running, Discord may still show noisy alerts from the previous
-version.
+## Optional Watch Integration
 
-## Discord Watcher
-
-The GSC script writes `CUSTOM_AC_*` lines into the game logs. The Node helper watches the log and sends Discord alerts.
-
-1. Copy:
-
-```text
-anticheat-discord-watcher.js
-anticheat-discord-config.example.json
-iw4m-client-map.py
-```
-
-2. Rename the config:
-
-```bash
-cp anticheat-discord-config.example.json anticheat-discord-config.json
-```
-
-3. Edit the webhook URL in `anticheat-discord-config.json`.
-
-Recommended Discord noise controls:
-
-```json
-"minDiscordScore": 120,
-"minDiscordStrongEvents": 2,
-"minDiscordEvidenceEvents": 3,
-"minDiscordUniqueVictims": 2,
-"reportEvidenceWindowMs": 1800000,
-"allowIncompleteMetricAlerts": false
-```
-
-This keeps weak/incomplete review lines in the local anti-cheat log without
-pinging Discord. Alerts with missing distance/angle/visibility metrics should
-not page staff unless you explicitly set `allowIncompleteMetricAlerts` to
-`true`.
-
-Successful IW4MAdmin `!report` penalties are read from the combined evidence
-log and linked by target GUID first. A report increases alert urgency only when
-meaningful telemetry also exists; reports alone never trigger anti-cheat pings.
-
-4. Start it:
-
-```bash
-node anticheat-discord-watcher.js
-```
-
-Use a systemd service or process manager if you want it always running.
-
-Keep `iw4m-client-map.py` in the same folder as
-`anticheat-discord-watcher.js`. The watcher uses it to generate
-`iw4m-client-map.json`, which lets the dashboard resolve GUIDs/profile links
-and make victim names clickable when they uniquely match an IW4MAdmin client.
-
-This should run as a background service/process. It should not require an active
-SSH shell after setup.
-
-## IW4MAdmin Dashboard
-
-Copy this plugin into IW4MAdmin's `Plugins` folder:
-
-```text
-iw4madmin/Plugins/AnticheatMetrics.js
-```
-
-Restart IW4MAdmin after copying it.
-
-The dashboard reads:
-
-```text
-Logs/anti-cheat-combined.log
-```
-
-It groups events into player cases and separates:
-
-- Risk: how suspicious the behavior looks
-- Confidence: how reliable the evidence is
-- Reports: successful IW4MAdmin `!report` commands linked to the reported player
-- Actions: Watch/Undo Watch, Clear, Purge/Recover, Send Review
-
-Purging starts a five-day recovery window. Purged cases remain available under
-the `Purged` filter with a `Recover` action until permanent cleanup is due; the
-evidence is not immediately destroyed.
-
-The dashboard is a review queue, not a raw event dump. Weak evidence stays in
-the combined anti-cheat log so it can build a pattern later, but it does not
-appear in the panel by itself. Uncertain but meaningful evidence can appear as
-`Watching`; stronger repeated/corroborated evidence becomes `Needs Review`.
-
-Visible dashboard cases generally require at least one of:
-
-- IW4MAdmin hard anti-cheat detection
-- player report support
-- moderation/action history
-- Discord review eligibility
-- risk `>= 60` and confidence `>= 45`
-- repeated suspicious telemetry with medium confidence across multiple events,
-  victims, or signal types
-
-This is intentional. It keeps the panel from filling with low-confidence trace
-quirks, lucky wallbangs, normal pre-aims, and other weak signals.
-
-Buffered patterns do not become review cases from repeated reason text alone.
-They need structured gameplay context (such as distance, angle, line of sight,
-visibility time, or hit location), multiple independent targets, or report
-support. Aggregated patterns receive their repetition bonus once; case scoring
-does not add the same source events a second time. Patterns with incomplete
-structured telemetry are capped below normal review confidence and remain in
-the evidence log for future correlation instead of filling the queue.
-
-The IW4MAdmin plugin listens for `ClientPenaltyAdministered` events whose
-penalty type is `Report`. IW4MAdmin emits this canonical event after
-`!report <player> <reason>` succeeds, with the reported player as the offender,
-the reporting player as the punisher, and the accepted report reason as the
-offense. The plugin writes that data as a normalized `PLAYER_REPORT` event in
-`Logs/anti-cheat-combined.log`. Failed or invalid report attempts do not create
-penalty events and therefore do not become anti-cheat evidence. Identical
-target/reporter/reason events are deduplicated for 30 seconds.
-
-Legacy report records whose GUID is `Unknown` are merged into a matching
-resolved-GUID case when player/server/client or profile aliases identify one
-unambiguous player. If an alias could refer to multiple GUIDs, it is left
-separate rather than risking an incorrect merge.
-Server aliases are color-code insensitive, allowing a report recorded under a
-plain IW4MAdmin hostname to join telemetry recorded under the colored hostname.
-
-If duplicate cases appear where one says `GUID Unknown` and another has a real
-GUID, restart IW4MAdmin and make sure the client map helper/watcher is running.
-The plugin will merge fallback player/server/client cases into the real GUID
-case once the GUID is known.
-
-Fields like `CapturedViewAngles`, `CurrentStrain`, `RecoilOffset`, and
-`SessionAverageSnapValue` are IW4MAdmin Stats anti-cheat snapshot fields. They
-will show `Not recorded` unless IW4MAdmin's own Stats anti-cheat is enabled and
-writing AC snapshots. The custom GSC review system still works without those
-fields, but those hard IW4MAdmin metrics will not appear.
-
-The visible case row and Discord review embed show the GUID only. IW4MAdmin
-already exposes client/profile details when you click the player profile link.
-
-## Optional IW4MAdmin Watch Flag Worker
-
-The Watch button can mark the player locally and attempt to flag them in IW4MAdmin.
-
-Copy:
-
-```text
-iw4madmin/Plugins/anticheat_iw4m_flag_worker.py
-systemd/anticheat-iw4m-flag-worker.service
-```
-
-You must edit paths in the service/script if your IW4MAdmin data folder is different.
-
-Install example:
+`iw4madmin/Plugins/anticheat_iw4m_flag_worker.py` lets the dashboard Watch action
+also flag the player in IW4MAdmin. Install the included systemd unit after
+adjusting its paths:
 
 ```bash
 sudo cp systemd/anticheat-iw4m-flag-worker.service /etc/systemd/system/
@@ -277,228 +68,62 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now anticheat-iw4m-flag-worker
 ```
 
-If the worker is not installed, Watch still works locally, but IW4MAdmin flagging may not be available.
+Without this worker, Watch still updates the local case.
 
 ## Automatic Updates
 
-Stable updates are distributed through GitHub Releases. The updater checks the
-latest release every two hours through a `systemd` timer, verifies the release
-SHA-256 checksum, backs up every replaced file, and uses atomic file
-replacement. It does not require an active SSH session.
-
-The default example configuration automatically applies updater, dashboard,
-and helper updates. GSC updates are left pending by default because activating
-them needs an IW4X map rotation or server restart and may disconnect players.
-
-The updater can also initialize and self-check an installation declaratively:
-
-- `initialization.directories` creates required runtime, log, and backup folders.
-- `initialization.seedFiles` copies example/default files only when the local
-  destination does not exist. Existing webhook configuration and secrets are
-  never overwritten.
-- `initialization.commands` performs site-specific one-time/idempotent setup.
-- `validationCommands` validates deployed JavaScript or other files before any
-  service restart. A failure restores the pre-update backup.
-- `healthChecks` supports multiple attempts, an optional `expectedOutput`
-  regular expression, and `repairCommands`. A failed check can restart its
-  affected service once and retry; continued failure rolls the release back.
-- `maintenanceCommands` and health checks also run when files are already
-  current, allowing the two-hour timer to repair configured services without
-  downloading another release.
-
-Initialization is intentionally config-driven. The updater does not guess
-container names, server paths, webhook secrets, or which live IW4X servers may
-be restarted. Put only safe, idempotent commands in these sections. Keep GSC
-automatic application disabled on populated servers unless map rotations or
-disconnects are acceptable.
-
-### Install the updater
-
-From a downloaded release or repository checkout:
+Releases include a SHA-256 checksum. The updater verifies it, backs up replaced
+files, validates the installation, and can roll back failed updates.
 
 ```bash
 sudo ./updater/install-updater.sh
 sudo nano /etc/iw4x-anticheat-updater.json
-```
-
-Set every `destination` to the corresponding file on the host. Add one pair of
-GSC destinations for each IW4X server. Configure restart commands as JSON
-argument arrays, without shell syntax. Examples:
-
-```json
-"restartCommands": {
-  "dashboard": [["docker", "restart", "iw4madmin"]],
-  "helpers": [["systemctl", "restart", "anticheat-discord-watcher"]],
-  "gsc": [["systemctl", "restart", "iw4x-server"]]
-}
-```
-
-Test the configuration before enabling automatic checks:
-
-```bash
 sudo /opt/iw4x-anticheat-updater/anticheat-updater.py --check
 sudo systemctl enable --now iw4x-anticheat-updater.timer
-systemctl list-timers iw4x-anticheat-updater.timer
 ```
 
-Before enabling it, replace every `/path/to/...` placeholder in the example.
-Run one manual update and inspect both the updater state and service health:
-
-```bash
-sudo systemctl start iw4x-anticheat-updater.service
-sudo systemctl status iw4x-anticheat-updater.service --no-pager
-sudo cat /var/lib/iw4x-anticheat-updater/state.json
-```
+Replace every `/path/to/...` value before enabling the timer. Dashboard and
+helper updates may be automatic. GSC updates default to staged because applying
+them requires a map rotation or IW4X restart. Updater activity appears in the
+dashboard System Status update log when `dashboardHistoryFile` is configured.
 
 Useful commands:
 
 ```bash
-# Install components enabled under autoApply
-sudo systemctl start iw4x-anticheat-updater.service
-
-# Install every component, including staged GSC updates
 sudo /opt/iw4x-anticheat-updater/anticheat-updater.py --apply-all
-
-# Restore the most recent pre-update backup
 sudo /opt/iw4x-anticheat-updater/anticheat-updater.py --rollback
-
-# Inspect the last updater run
 journalctl -u iw4x-anticheat-updater.service -n 100 --no-pager
 ```
 
-Local webhook configuration, databases, logs, and server configuration are not
-release targets and are never overwritten. For a private GitHub repository,
-provide a read-only `GITHUB_TOKEN` through a systemd environment file. A token
-is not needed while the repository is public.
+## Validation
 
-### Publish an update
-
-Update `VERSION`, commit the tested files, and push a matching version tag:
+Run the included checks before deployment:
 
 ```bash
-version="$(tr -d '[:space:]' < VERSION)"
-git tag "v${version}"
-git push origin main "v${version}"
+node --test tests/*.test.js
+python3 -m unittest updater/test_updater.py
+node --check iw4madmin/Plugins/AnticheatMetrics.js
+node --check anticheat-discord-watcher.js
 ```
 
-The GitHub Actions release workflow builds
-`iw4x-anticheat-release.zip`, generates its checksum, and publishes both files
-to the matching GitHub Release. Installed updaters then discover it on their
-next scheduled check.
+After deployment, verify:
 
-## System Status diagnostics
+- both GSC scripts load without compile errors;
+- `Logs/anti-cheat-combined.log` receives meaningful telemetry;
+- successful IW4MAdmin `!report` events attach to the reported player's case;
+- weak or incomplete events stay buffered instead of filling the review queue;
+- Discord only pages staff for repeated, corroborated, or hard evidence.
 
-The bottom of the IW4MAdmin **Anticheat** page shows operational status for the
-dashboard plugin, Discord/log watcher, evidence storage, client profile map,
-and each configured server's anti-cheat and killstreak GSC scripts.
-The System Status header and Dashboard Plugin check display the version loaded
-by IW4MAdmin, which may differ from GitHub's latest release until an update is
-installed and IW4MAdmin restarts.
+## Evidence Safety
 
-The existing Node watcher verifies each configured GSC file, its `custom.gsc`
-hook, the current IW4X console state, and later gameplay activity. It writes the result to
-`Logs/anticheat-health.json` every 15 seconds. No webhook URL or other secret is
-written to that file. A green check means the script is installed and its hook
-was present in a successfully loaded `custom.gsc`; the killstreak logger also
-has an explicit runtime load marker. Compile failures and missing hooks are
-reported separately.
+Risk describes how suspicious behavior looks. Confidence describes evidence
+reliability. One poor line-of-sight event, one report, or a high-risk event with
+low confidence is not proof. Review repeated events, unique victims, native
+IW4MAdmin detections, reports, weapon context, and false-positive risk together.
 
-After installing this update, rotate/restart each IW4X server so the updated GSC
-scripts load, then restart `anticheat-discord-watcher` and IW4MAdmin. Configure
-the `consoleFile`, `serverConfig`, `customScript`, `antiCheatScript`, and `killstreakScript`
-paths for every server in `anticheat-discord-config.json`.
+Native snapshot fields such as `CapturedViewAngles`, `CurrentStrain`, and
+`RecoilOffset` show `Not recorded` unless IW4MAdmin Stats anti-cheat produced a
+snapshot. The custom telemetry still works without those fields.
 
-## Testing
-
-For bot testing:
-
-1. Set `ac_suspicion_include_bots "1"`.
-2. Restart or reload the map.
-3. Join the server.
-4. Use suspicious behavior intentionally:
-   - Hold crosshair on a hidden bot for about 1 second
-   - Kill that same bot shortly afterward
-   - Repeat several times
-5. Check Discord, the anti-cheat log, and the IW4MAdmin Anti-cheat page.
-
-Useful reasons to look for:
-
-```text
-Held crosshair on this hidden target before killing them
-Repeatedly held crosshair on hidden targets before killing them
-Aimed at this target through a wall before killing them
-ADS aim stayed tightly locked on the victim after a sudden correction
-Victim had Ninja, so heartbeat sensor did not explain the hidden-target push
-Single long-range sniper hidden-target read; confidence reduced until repeated
-```
-
-## Interpreting Evidence
-
-Do not act on one event by itself unless it is very high confidence.
-
-Good review rule:
-
-```text
-High risk + medium/high confidence + repeated events = worth staff review.
-High risk + low confidence = watch only.
-Reports only = not proof.
-One poor line-of-sight event = supporting evidence, not proof.
-```
-
-Example:
-
-```text
-RiskScore: 74
-ConfidenceScore: 35
-FalsePositiveRisk: High
-Probability: Low
-Reports: 0
-```
-
-That is **not a ban-worthy record by itself**. It means the event looked suspicious, but the system thinks the reliability is weak. Use it as a reason to keep watching for repeated patterns.
-
-## Notes
-
-- IW4MAdmin native anti-cheat snapshot fields are displayed in raw/debug details if present.
-
-### Native IW4MAdmin detections and evidence promotion
-
-Version 1.0.8 imports native IW4MAdmin `Flag` penalties for the `Snap`,
-`Strain`, `Offset`, `Recoil`, `Bone`, `Chest`, and `Button` detectors as hard
-detections. These are logged when IW4MAdmin itself crosses its configured
-sample threshold; individual native hits are not copied into the review queue.
-Flags created by the Anticheat Panel's Watch action are explicitly excluded.
-
-Custom GSC evidence uses a 15-minute candidate buffer. A normal soft pattern
-must contain at least three similar events, structured metrics from at least two
-events, two distinct signal families, and at least two victims before it is
-promoted. One isolated LOS trace or repeated evidence against only one victim
-stays out of the visible queue. A successful player report can support earlier
-promotion, but still requires at least two meaningful telemetry events.
-
-This makes native detector output the strongest evidence while preserving the
-custom system as supporting context. It does not enable automatic permanent
-bans.
-
-Version 1.0.8 also prevents cumulative GSC scores from being reused as the risk
-of every individual event. Generic `aim_suspicion` and LOS labels from one kill
-no longer count as independent evidence by themselves. Visibility-only patterns
-remain Monitoring with high false-positive risk unless at least three explicit
-mechanical aim events span multiple victims, a player report corroborates the
-telemetry, or IW4MAdmin produces a native hard detection.
-
-Version 1.0.9 keeps dashboard loading bounded as the evidence log grows. The
-review queue reads and caches only the newest 2 MiB of the log for its latest
-300 events; the complete append-only log remains available for audit and purge
-recovery. Summary metrics are now clickable queue filters and always select the
-most-recent ordering.
-
-Discord paging is also more selective in 1.0.9. Visibility and line-of-sight
-signals remain supporting evidence, but telemetry-only alerts now require a
-repeated mechanical aim pattern across multiple victims. Report-supported
-alerts still require meaningful gameplay telemetry, and the effective alert
-cooldown is at least ten minutes even when an older config contains a shorter
-value. This keeps skilled or unusual single kills in the review buffer without
-repeatedly paging staff.
-- If the IW4MAdmin database has no `EFACSnapshot` rows, fields like `CapturedViewAngles`, `CurrentStrain`, `RecoilOffset`, and `SessionAverageSnapValue` will show as `Not recorded`.
-- This system should support human review, not replace it.
+This project is an admin review aid. Automatic permanent bans are intentionally
+not enabled.

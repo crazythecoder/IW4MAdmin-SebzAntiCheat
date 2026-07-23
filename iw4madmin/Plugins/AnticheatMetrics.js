@@ -9,7 +9,7 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
 
 const plugin = {
     author: 'Local',
-    version: '1.0.9',
+    version: '1.0.13',
     name: 'Anticheat Metrics',
     logger: null,
     config: null,
@@ -20,6 +20,7 @@ const plugin = {
     settings: {
         logPath: '/app/Logs/anti-cheat-combined.log',
         healthPath: '/app/Logs/anticheat-health.json',
+        updateHistoryPath: '/app/Logs/anticheat-update-history.json',
         healthStaleSeconds: 420,
         maxItems: 300,
         dashboardLogTailBytes: 2097152,
@@ -40,6 +41,7 @@ const plugin = {
         candidateMinConfidence: 55,
         candidateMinUniqueVictims: 2,
         candidateMinStructuredEvents: 2,
+        evidenceDuplicateWindowMs: 2500,
         purgeRetentionDays: 5
     },
 
@@ -173,10 +175,13 @@ const plugin = {
         const actionResult = this.handleDashboardAction(meta, originId);
         const items = this.readEvents();
         const cases = this.buildCases(items);
+        this.logger.logInformation('{Name} dashboard render. ParsedEvents={ParsedEvents}, ReviewCases={ReviewCases}, LogPath={LogPath}',
+            this.name, items.length, cases.length, this.settings.logPath);
         const purgedCases = this.recoverablePurgedCases();
         const queueCases = cases.concat(purgedCases);
         const stats = this.dashboardStats(cases, items);
         const systemHealth = this.readSystemHealth();
+        const updateHistory = this.readUpdateHistory();
         const openCaseId = this.clean(this.metaValue(meta, 'acCase'), '');
 
         if (openCaseId) {
@@ -269,7 +274,7 @@ const plugin = {
 
         html += `
                 </section>
-                ${this.systemHealthPanel(systemHealth)}
+                ${this.systemHealthPanel(systemHealth, updateHistory)}
             </div>
             <script>
                 (() => {
@@ -281,6 +286,7 @@ const plugin = {
                         filter: 'all',
                         sort: 'risk',
                         autoRefresh: true,
+                        updateLogOpen: false,
                         expanded: {},
                         scrollY: 0
                     };
@@ -353,6 +359,15 @@ const plugin = {
 
                     const applyControls = () => {
                         const state = loadState();
+                        const updateLog = document.getElementById('ac-update-log');
+                        const updateToggle = document.querySelector('[data-ac-update-log-toggle]');
+                        if (updateLog) {
+                            updateLog.hidden = !state.updateLogOpen;
+                        }
+                        if (updateToggle) {
+                            updateToggle.setAttribute('aria-expanded', state.updateLogOpen ? 'true' : 'false');
+                            updateToggle.classList.toggle('is-open', !!state.updateLogOpen);
+                        }
                         const filter = document.getElementById('ac-filter');
                         const sort = document.getElementById('ac-sort');
                         const list = document.getElementById('ac-case-list');
@@ -438,6 +453,13 @@ const plugin = {
                         const sort = document.getElementById('ac-sort');
                         const refresh = document.getElementById('ac-refresh-now');
                         const auto = document.getElementById('ac-auto-toggle');
+                        const updateToggle = document.querySelector('[data-ac-update-log-toggle]');
+
+                        updateToggle?.addEventListener('click', () => {
+                            const state = loadState();
+                            saveState({ updateLogOpen: !state.updateLogOpen });
+                            applyControls();
+                        });
 
                         document.querySelectorAll('#anticheat-metrics-panel [data-ac-stat-filter]').forEach(card => {
                             card.addEventListener('click', () => {
@@ -692,6 +714,43 @@ const plugin = {
         return result;
     },
 
+    readUpdateHistory: function () {
+        const io = importNamespace('System.IO');
+        const path = String(this.settings.updateHistoryPath || '/app/Logs/anticheat-update-history.json');
+        const result = { available: false, latestVersion: '', lastCheck: '', events: [] };
+        if (!io.File.Exists(path)) {
+            return result;
+        }
+
+        try {
+            const value = JSON.parse(String(io.File.ReadAllText(path)));
+            result.available = true;
+            result.latestVersion = this.clean(value.latestVersion || '');
+            result.lastCheck = this.clean(value.lastCheck || '');
+            result.events = (Array.isArray(value.history) ? value.history : []).slice(0, 30).map(event => ({
+                id: this.clean(event.id || ''),
+                timestamp: this.clean(event.timestamp || ''),
+                status: this.clean(event.status || 'current').toLowerCase(),
+                title: this.clean(event.title || 'Updater activity'),
+                detail: this.clean(event.detail || ''),
+                version: this.clean(event.version || ''),
+                restartRequired: event.restartRequired === true
+            }));
+        } catch (ex) {
+            result.available = true;
+            result.events = [{
+                id: 'history-read-error',
+                timestamp: '',
+                status: 'failed',
+                title: 'Update history could not be read',
+                detail: this.clean(ex.message || ex.toString()),
+                version: '',
+                restartRequired: false
+            }];
+        }
+        return result;
+    },
+
     healthAgeSeconds: function (value, now) {
         const timestamp = Date.parse(String(value || ''));
         if (!timestamp) {
@@ -742,7 +801,7 @@ const plugin = {
         };
     },
 
-    systemHealthPanel: function (health) {
+    systemHealthPanel: function (health, updateHistory) {
         const servers = health.servers || [];
         const hasAttention = health.watcher.state === 'bad' || servers.some(server =>
             server.log.state === 'bad' || server.log.state === 'warning' ||
@@ -778,8 +837,14 @@ const plugin = {
                     <div class="ac-system-heading-meta">
                         <span class="ac-system-version"><i class="ph ph-tag"></i> v${this.escape(this.version)}</span>
                         <span class="ac-system-overall ${overallClass}">${this.escape(overallLabel)}</span>
+                        <button type="button" class="ac-update-log-toggle" data-ac-update-log-toggle aria-expanded="false" aria-controls="ac-update-log">
+                            <i class="ph ph-clock-counter-clockwise"></i>
+                            <span>Update log</span>
+                            ${updateHistory && updateHistory.events && updateHistory.events.length ? `<b>${this.escape(updateHistory.events.length)}</b>` : ''}
+                        </button>
                     </div>
                 </div>
+                ${this.updateHistoryPanel(updateHistory)}
                 <div class="ac-system-core">
                     ${this.healthCell('Dashboard plugin', { state: 'good', label: `v${this.version} loaded`, detail: `This page was rendered by Anticheat Metrics v${this.version}.` })}
                     ${this.healthCell('Log watcher', health.watcher)}
@@ -789,6 +854,50 @@ const plugin = {
                 <div class="ac-system-servers">${serverRows}</div>
                 <p class="ac-system-note">A green check confirms the script loaded for the current game session. A gray clock means verification is still pending; it does not automatically mean the component failed.</p>
             </section>`;
+    },
+
+    updateHistoryPanel: function (history) {
+        const events = history && Array.isArray(history.events) ? history.events : [];
+        const statusMeta = status => {
+            const values = {
+                checking: ['ph-magnifying-glass', 'is-info'],
+                available: ['ph-download-simple', 'is-info'],
+                staged: ['ph-package', 'is-staged'],
+                installing: ['ph-gear-six', 'is-warning'],
+                applied: ['ph-check-circle', 'is-success'],
+                failed: ['ph-warning-circle', 'is-failed'],
+                current: ['ph-check', 'is-neutral']
+            };
+            return values[status] || ['ph-info', 'is-neutral'];
+        };
+        const rows = events.length ? events.map(event => {
+            const meta = statusMeta(event.status);
+            return `<article class="ac-update-event ${meta[1]}">
+                <div class="ac-update-event-icon"><i class="ph ${meta[0]}"></i></div>
+                <div class="ac-update-event-body">
+                    <div class="ac-update-event-title">
+                        <strong>${this.escape(event.title)}</strong>
+                        ${event.version ? `<span>v${this.escape(event.version)}</span>` : ''}
+                    </div>
+                    ${event.detail ? `<p>${this.escape(event.detail)}</p>` : ''}
+                    <div class="ac-update-event-meta">
+                        ${event.timestamp ? `<time class="js-local-time" datetime="${this.escape(event.timestamp)}">${this.escape(event.timestamp)}</time>` : '<span>Time not recorded</span>'}
+                        ${event.restartRequired ? '<span><i class="ph ph-arrow-clockwise"></i> IW4MAdmin restart may be required</span>' : ''}
+                    </div>
+                </div>
+            </article>`;
+        }).join('') : `<div class="ac-update-empty">
+            <i class="ph ph-clock-counter-clockwise"></i>
+            <div><strong>No updater activity recorded yet.</strong><span>The next updater check will appear here automatically.</span></div>
+        </div>`;
+
+        return `<div id="ac-update-log" class="ac-update-log" hidden>
+            <div class="ac-update-log-heading">
+                <div><h3>Update activity</h3><p>Detection, download, installation, and validation events from the anti-cheat updater.</p></div>
+                ${history && history.lastCheck ? `<span>Last check <time class="js-local-time" datetime="${this.escape(history.lastCheck)}">${this.escape(history.lastCheck)}</time></span>` : ''}
+            </div>
+            <div class="ac-update-events">${rows}</div>
+        </div>`;
     },
 
     healthCell: function (label, status) {
@@ -2165,6 +2274,92 @@ const plugin = {
                     font-weight: 600;
                     white-space: nowrap;
                 }
+                #anticheat-metrics-panel .ac-update-log-toggle {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 6px;
+                    min-height: 30px;
+                    padding: 5px 9px;
+                    border: 1px solid var(--ac-line);
+                    border-radius: 7px;
+                    background: rgba(255,255,255,.025);
+                    color: var(--ac-muted);
+                    font-size: 11px;
+                    font-weight: 600;
+                    cursor: pointer;
+                }
+                #anticheat-metrics-panel .ac-update-log-toggle:hover,
+                #anticheat-metrics-panel .ac-update-log-toggle:focus-visible,
+                #anticheat-metrics-panel .ac-update-log-toggle.is-open {
+                    border-color: rgba(112,153,209,.34);
+                    background: rgba(112,153,209,.08);
+                    color: var(--ac-text);
+                    outline: none;
+                }
+                #anticheat-metrics-panel .ac-update-log-toggle b {
+                    min-width: 18px;
+                    padding: 1px 5px;
+                    border-radius: 999px;
+                    background: rgba(112,153,209,.12);
+                    color: #a9c3e5;
+                    font-size: 9px;
+                    text-align: center;
+                }
+                #anticheat-metrics-panel .ac-update-log {
+                    margin: 0 0 18px;
+                    padding: 16px;
+                    border: 1px solid var(--ac-line);
+                    border-radius: 8px;
+                    background: rgba(0,0,0,.1);
+                }
+                #anticheat-metrics-panel .ac-update-log[hidden] { display: none; }
+                #anticheat-metrics-panel .ac-update-log-heading {
+                    display: flex;
+                    align-items: flex-start;
+                    justify-content: space-between;
+                    gap: 16px;
+                    padding-bottom: 12px;
+                    border-bottom: 1px solid var(--ac-line);
+                }
+                #anticheat-metrics-panel .ac-update-log-heading h3 { margin: 0; color: var(--ac-text); font-size: 14px; font-weight: 650; }
+                #anticheat-metrics-panel .ac-update-log-heading p { margin: 4px 0 0; color: var(--ac-muted-2); font-size: 11px; }
+                #anticheat-metrics-panel .ac-update-log-heading > span { color: var(--ac-muted-2); font-size: 10px; white-space: nowrap; }
+                #anticheat-metrics-panel .ac-update-events { display: grid; }
+                #anticheat-metrics-panel .ac-update-event {
+                    display: grid;
+                    grid-template-columns: 30px minmax(0, 1fr);
+                    gap: 10px;
+                    padding: 12px 0;
+                    border-bottom: 1px solid var(--ac-line);
+                }
+                #anticheat-metrics-panel .ac-update-event:last-child { border-bottom: 0; padding-bottom: 0; }
+                #anticheat-metrics-panel .ac-update-event-icon {
+                    display: grid;
+                    place-items: center;
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 7px;
+                    background: rgba(255,255,255,.035);
+                    color: var(--ac-muted);
+                    font-size: 16px;
+                }
+                #anticheat-metrics-panel .ac-update-event.is-success .ac-update-event-icon { background: rgba(120,198,154,.1); color: #a5d7ba; }
+                #anticheat-metrics-panel .ac-update-event.is-failed .ac-update-event-icon { background: rgba(239,115,115,.1); color: #eda1a1; }
+                #anticheat-metrics-panel .ac-update-event.is-warning .ac-update-event-icon,
+                #anticheat-metrics-panel .ac-update-event.is-staged .ac-update-event-icon { background: rgba(217,164,65,.1); color: #ddc186; }
+                #anticheat-metrics-panel .ac-update-event.is-info .ac-update-event-icon { background: rgba(112,153,209,.1); color: #a9c3e5; }
+                #anticheat-metrics-panel .ac-update-event-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+                #anticheat-metrics-panel .ac-update-event-title strong { color: var(--ac-text); font-size: 12.5px; font-weight: 650; }
+                #anticheat-metrics-panel .ac-update-event-title span { color: var(--ac-muted-2); font-size: 10px; }
+                #anticheat-metrics-panel .ac-update-event-body p { margin: 4px 0 0; color: var(--ac-muted); font-size: 11px; line-height: 1.45; }
+                #anticheat-metrics-panel .ac-update-event-meta { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 6px; color: var(--ac-muted-2); font-size: 9.5px; }
+                #anticheat-metrics-panel .ac-update-event-meta span { display: inline-flex; align-items: center; gap: 4px; }
+                #anticheat-metrics-panel .ac-update-empty { display: flex; align-items: center; gap: 10px; padding: 14px 0 2px; color: var(--ac-muted-2); }
+                #anticheat-metrics-panel .ac-update-empty > i { font-size: 20px; }
+                #anticheat-metrics-panel .ac-update-empty strong,
+                #anticheat-metrics-panel .ac-update-empty span { display: block; }
+                #anticheat-metrics-panel .ac-update-empty strong { color: var(--ac-muted); font-size: 12px; }
+                #anticheat-metrics-panel .ac-update-empty span { margin-top: 2px; font-size: 10px; }
                 #anticheat-metrics-panel .ac-system-overall {
                     display: inline-flex;
                     align-items: center;
@@ -2269,6 +2464,7 @@ const plugin = {
                     #anticheat-metrics-panel .ac-raw-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
                     #anticheat-metrics-panel .ac-evidence-details { margin-left: 0; text-align: left; }
                     #anticheat-metrics-panel .ac-system-heading { align-items: flex-start; flex-direction: column; }
+                    #anticheat-metrics-panel .ac-update-log-heading { flex-direction: column; }
                 }
                 @media (max-width: 520px) {
                     #anticheat-metrics-panel .ac-metrics-strip,
@@ -3107,6 +3303,7 @@ const plugin = {
         });
 
         normalizedItems = this.deduplicateReportEvents(normalizedItems);
+        normalizedItems = this.deduplicateEvidenceEvents(normalizedItems);
         normalizedItems = this.promoteTimelineEvidence(normalizedItems);
 
         normalizedItems.forEach(item => {
@@ -3286,6 +3483,10 @@ const plugin = {
                 return;
             }
 
+            if (!this.hasMinimumTelemetryQuality(event)) {
+                return;
+            }
+
             candidatesByCase[caseId] = candidatesByCase[caseId] || [];
             candidatesByCase[caseId].push(event);
         });
@@ -3293,6 +3494,7 @@ const plugin = {
         const promoted = protectedEvents.slice();
         Object.keys(candidatesByCase).forEach(caseId => {
             const candidates = candidatesByCase[caseId]
+                .filter(event => this.hasMinimumTelemetryQuality(event))
                 .filter(event => Number.isFinite(Date.parse(event.timestamp || event.time || '')))
                 .sort((a, b) => Date.parse(a.timestamp || a.time) - Date.parse(b.timestamp || b.time));
             const windows = this.timelineCandidateWindows(candidates);
@@ -3324,7 +3526,7 @@ const plugin = {
             type === 'player_report' ||
             type === 'moderation_action' ||
             type === 'manual_note' ||
-            Boolean(event && (event.action || event.isAutomatedBan || event.crossedDiscordAlertRules)) ||
+            Boolean(event && (event.action || event.isAutomatedBan)) ||
             kind === 'ALERT' || kind === 'REVIEW_ALERT' || kind === 'AUTO_BAN' || kind === 'AUTO_TEMPBAN';
     },
 
@@ -3336,7 +3538,7 @@ const plugin = {
             !this.isAimLockLikeEvent(event) && !this.hasStrongAimAngle(event);
         return risk >= Math.max(75, Number(this.settings.candidateMinRisk || 65)) &&
             confidence >= Math.max(65, Number(this.settings.candidateMinConfidence || 55)) &&
-            this.hasStructuredTelemetry(event) && !softVisibilityOnly && !highFalsePositiveRisk;
+            this.hasMinimumTelemetryQuality(event) && !softVisibilityOnly && !highFalsePositiveRisk;
     },
 
     timelineCandidateWindows: function (events) {
@@ -3376,7 +3578,7 @@ const plugin = {
         const end = Date.parse(events[events.length - 1].timestamp || events[events.length - 1].time || '') || start;
         const windowMs = Math.max(1, Number(this.settings.candidateWindowMinutes || 15)) * 60 * 1000;
         const reportSupported = (reportTimes || []).some(at => at > 0 && at >= start - windowMs && at <= end + windowMs);
-        const structuredTelemetryEvents = events.filter(event => this.hasStructuredTelemetry(event)).length;
+        const structuredTelemetryEvents = events.filter(event => this.hasMinimumTelemetryQuality(event)).length;
         const mechanicalAimEvents = events.filter(event => this.isMechanicalAimEvent(event));
         const mechanicalVictims = [];
         mechanicalAimEvents.forEach(event => {
@@ -3476,6 +3678,37 @@ const plugin = {
         return values.filter(value => this.isKnownTelemetryValue(value)).length >= 2;
     },
 
+    telemetryQualityCount: function (event) {
+        const values = [
+            event && event.distance,
+            event && event.angle,
+            event && event.lineOfSight,
+            event && event.visibleTime,
+            event && event.hitLocation,
+            event && (event.victimName || event.victim),
+            event && event.weapon
+        ];
+        return values.filter(value => this.isKnownTelemetryValue(value)).length;
+    },
+
+    hasMinimumTelemetryQuality: function (event) {
+        if (!event) {
+            return false;
+        }
+        if (this.isProtectedTimelineEvent(event)) {
+            return true;
+        }
+
+        const coreKnown = this.isKnownTelemetryValue(event.distance) &&
+            this.isKnownTelemetryValue(event.angle) &&
+            this.isKnownTelemetryValue(event.lineOfSight);
+        const identityKnown = this.isKnownTelemetryValue(event.victimName || event.victim) &&
+            this.isKnownTelemetryValue(event.weapon);
+        const outcomeKnown = this.isKnownTelemetryValue(event.visibleTime) ||
+            this.isKnownTelemetryValue(event.hitLocation);
+        return coreKnown && identityKnown && outcomeKnown && this.telemetryQualityCount(event) >= 6;
+    },
+
     isKnownTelemetryValue: function (value) {
         const text = this.clean(value === undefined || value === null ? '' : value).toLowerCase();
         return !!text && text !== '?' && text !== 'unknown' && text !== 'not recorded' &&
@@ -3546,7 +3779,7 @@ const plugin = {
             return true;
         }
 
-        if (risk >= 75 && confidence >= 65 && this.hasStructuredTelemetry(group.latest || group)) {
+        if (risk >= 75 && confidence >= 65 && this.hasMinimumTelemetryQuality(group.latest || group)) {
             return true;
         }
 
@@ -3620,6 +3853,48 @@ const plugin = {
                 const currentGuid = this.identityValue(event.playerGuid || event.guid || '');
                 const priorGuid = this.identityValue(prior.event.playerGuid || prior.event.guid || '');
                 if (currentGuid && !priorGuid) {
+                    retained[prior.index] = event;
+                    recent[key] = { at: at, event: event, index: prior.index };
+                }
+                return;
+            }
+
+            recent[key] = { at: at, event: event, index: retained.length };
+            retained.push(event);
+        });
+
+        return retained;
+    },
+
+    deduplicateEvidenceEvents: function (events) {
+        const retained = [];
+        const recent = {};
+        const duplicateWindowMs = Math.max(250, Number(this.settings.evidenceDuplicateWindowMs || 2500));
+
+        (events || []).forEach(event => {
+            if (this.isProtectedTimelineEvent(event) || event.aggregated) {
+                retained.push(event);
+                return;
+            }
+
+            const at = Date.parse(event.timestamp || event.time || '') || 0;
+            const reasons = (event.rawReasons || event.reasons || []).map(reason => this.clean(reason).toLowerCase()).sort().join('|');
+            const key = [
+                event.caseId,
+                this.normalizedPlayerName(event.victimName || event.victim || ''),
+                this.clean(event.weapon || '').toLowerCase(),
+                this.clean(event.distance || '').toLowerCase(),
+                this.clean(event.angle || '').toLowerCase(),
+                this.clean(event.lineOfSight || '').toLowerCase(),
+                this.clean(event.hitLocation || '').toLowerCase(),
+                reasons
+            ].join('|');
+            const prior = recent[key];
+
+            if (prior && at > 0 && prior.at > 0 && Math.abs(at - prior.at) <= duplicateWindowMs) {
+                const currentQuality = this.telemetryQualityCount(event) + (this.identityValue(event.playerGuid || event.guid || '') ? 2 : 0);
+                const priorQuality = this.telemetryQualityCount(prior.event) + (this.identityValue(prior.event.playerGuid || prior.event.guid || '') ? 2 : 0);
+                if (currentQuality > priorQuality) {
                     retained[prior.index] = event;
                     recent[key] = { at: at, event: event, index: prior.index };
                 }
@@ -5289,21 +5564,46 @@ const plugin = {
             const items = [];
             const alertIncidents = {};
 
-            for (let i = blocks.length - 1; i >= 0 && items.length < Number(this.settings.maxItems || 75); i--) {
+            const maxItems = Math.max(75, Number(this.settings.maxItems || 300));
+            const maxEvidencePerIdentity = Math.max(6, Number(this.settings.maxEvidencePerIdentity || 24));
+            const evidenceByIdentity = {};
+
+            // Scan the complete bounded tail. On populated servers, weak evidence can exceed
+            // maxItems in minutes and must not crowd older alerts/reports out of the queue.
+            for (let i = blocks.length - 1; i >= 0; i--) {
                 const item = this.parseBlock(blocks[i]);
                 if (item) {
                     const incidentKey = this.incidentKey(item);
+                    const kind = String(item.kind || '').toUpperCase();
 
-                    if (item.kind === 'REVIEW_ALERT') {
+                    if (kind === 'REVIEW_ALERT' || kind === 'DISCORD_SUPPRESSED') {
                         continue;
                     }
 
-                    if (item.kind === 'EVIDENCE' && incidentKey && alertIncidents[incidentKey]) {
+                    if (kind === 'EVIDENCE' && incidentKey && alertIncidents[incidentKey]) {
                         continue;
                     }
 
-                    if (item.kind === 'ALERT' && incidentKey) {
+                    if (kind === 'ALERT' && incidentKey) {
                         alertIncidents[incidentKey] = true;
+                    }
+
+                    const protectedItem = kind === 'ALERT' || kind === 'PLAYER_REPORT' ||
+                        kind === 'IW4M_FLAG' || kind === 'AUTO_BAN' || kind === 'AUTO_TEMPBAN';
+                    if (!protectedItem) {
+                        if (items.length >= maxItems) {
+                            continue;
+                        }
+
+                        const identity = [
+                            this.clean(item.guid || item.player || '').toLowerCase(),
+                            this.normalizedServerIdentity(item.server || item.serverKey || '')
+                        ].join('|');
+                        evidenceByIdentity[identity] = Number(evidenceByIdentity[identity] || 0);
+                        if (evidenceByIdentity[identity] >= maxEvidencePerIdentity) {
+                            continue;
+                        }
+                        evidenceByIdentity[identity]++;
                     }
 
                     items.push(item);
@@ -5320,20 +5620,9 @@ const plugin = {
 
     readLogTail: function (path, maxBytes) {
         const io = importNamespace('System.IO');
-        const system = importNamespace('System');
-        const text = importNamespace('System.Text');
-        const stream = io.File.Open(path, io.FileMode.Open, io.FileAccess.Read, io.FileShare.ReadWrite);
-
-        try {
-            const length = Number(stream.Length || 0);
-            const count = Math.min(Math.max(65536, Number(maxBytes || 2097152)), length);
-            stream.Seek(Math.max(0, length - count), io.SeekOrigin.Begin);
-            const buffer = system.Array.CreateInstance(system.Byte, count);
-            const read = stream.Read(buffer, 0, count);
-            return String(text.Encoding.UTF8.GetString(buffer, 0, read));
-        } finally {
-            stream.Dispose();
-        }
+        const raw = String(io.File.ReadAllText(path) || '');
+        const limit = Math.max(65536, Number(maxBytes || 2097152));
+        return raw.length > limit ? raw.substring(raw.length - limit) : raw;
     },
 
     parseBlock: function (block) {

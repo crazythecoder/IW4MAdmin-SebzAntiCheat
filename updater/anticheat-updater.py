@@ -135,11 +135,22 @@ class Updater:
         self.config_path = Path(config_path)
         self.config = read_json(self.config_path)
         self.state_path = Path(self.config.get("stateFile", "/var/lib/iw4x-anticheat-updater/state.json"))
+        self.dashboard_history_path = self.resolve_dashboard_history_path()
         self.backup_root = Path(self.config.get("backupDirectory", "/var/lib/iw4x-anticheat-updater/backups"))
         self.apply_all = apply_all
         self.force = force
         self.state = self.load_state()
         self.validate_configuration()
+
+    def resolve_dashboard_history_path(self):
+        configured = self.config.get("dashboardHistoryFile")
+        if configured:
+            return Path(configured)
+        for target in self.config.get("targets", {}).get("dashboard", []):
+            destination = Path(str(target.get("destination", "")))
+            if destination.name and destination.parent.name.lower() == "plugins":
+                return destination.parent.parent / "Logs" / "anticheat-update-history.json"
+        return Path("/var/lib/iw4x-anticheat-updater/update-history.json")
 
     def validate_configuration(self):
         repository = str(self.config.get("repository") or "")
@@ -194,6 +205,40 @@ class Updater:
 
     def save_state(self):
         write_json_atomic(self.state_path, self.state)
+        try:
+            write_json_atomic(self.dashboard_history_path, {
+                "latestVersion": self.state.get("latestVersion"),
+                "lastCheck": self.state.get("lastCheck"),
+                "lastSuccess": self.state.get("lastSuccess"),
+                "lastError": self.state.get("lastError"),
+                "history": self.state.get("history", []),
+            })
+        except OSError as error:
+            print("Warning: dashboard update history could not be written: {}".format(error), file=sys.stderr)
+
+    def record_history(self, status, title, detail, version=None, components=None, restart_required=False):
+        history = self.state.setdefault("history", [])
+        history.insert(0, {
+            "id": "{}-{}".format(int(time.time() * 1000), len(history)),
+            "timestamp": utc_now(),
+            "status": status,
+            "title": title,
+            "detail": detail,
+            "version": version,
+            "components": list(components or []),
+            "restartRequired": bool(restart_required),
+        })
+        del history[100:]
+        self.save_state()
+
+    def requires_iw4madmin_restart(self, components):
+        for component in components or []:
+            if "dashboard" in component.lower() or "iw4madmin" in component.lower():
+                return True
+            for target in self.config.get("targets", {}).get(component, []):
+                if "iw4madmin" in str(target.get("destination", "")).lower():
+                    return True
+        return False
 
     def selected_components(self):
         selected = []
@@ -331,20 +376,43 @@ class Updater:
 
     def apply(self, check_only=False):
         self.initialize_directories()
+        self.record_history("checking", "Checking for updates", "Contacting GitHub Releases for the latest stable anti-cheat package.")
         release, version, token = self.check_release()
         pending = self.pending_components(version)
         if not pending:
+            self.record_history("current", "No update available", "All enabled anti-cheat components are current.", version=version)
             print("Anti-cheat components are current at release v{}".format(version))
             if not check_only:
                 run_commands(self.config.get("maintenanceCommands", []), "maintenance")
                 self.run_operational_checks()
             return
+        restart_required = self.requires_iw4madmin_restart(pending)
+        self.record_history(
+            "available",
+            "New update detected",
+            "Release v{} is available for {}.".format(version, ", ".join(pending)),
+            version=version,
+            components=pending,
+            restart_required=restart_required,
+        )
         print("Release v{} is available for: {}".format(version, ", ".join(pending)))
         if check_only:
             return
 
         with tempfile.TemporaryDirectory(prefix="iw4x-anticheat-update-") as work_dir:
-            archive = self.download_release(release, token, work_dir)
+            try:
+                archive = self.download_release(release, token, work_dir)
+            except Exception as error:
+                self.record_history("failed", "Update download failed", str(error), version=version, components=pending)
+                raise
+            self.record_history(
+                "staged",
+                "Update staged",
+                "Release v{} downloaded and passed checksum verification.".format(version),
+                version=version,
+                components=pending,
+                restart_required=restart_required,
+            )
             extract_dir = Path(work_dir) / "package"
             extract_dir.mkdir()
             safe_extract(archive, extract_dir)
@@ -353,7 +421,28 @@ class Updater:
             packaged_version = (extract_dir / "VERSION").read_text(encoding="utf-8").strip()
             if version_tuple(packaged_version) != version_tuple(version):
                 raise RuntimeError("Release tag and packaged VERSION do not match")
-            backup = self.install(extract_dir, version, pending)
+            self.record_history(
+                "installing",
+                "Applying update",
+                "Installing {} from release v{}.".format(", ".join(pending), version),
+                version=version,
+                components=pending,
+                restart_required=restart_required,
+            )
+            try:
+                backup = self.install(extract_dir, version, pending)
+            except Exception as error:
+                self.record_history("failed", "Update installation failed", str(error), version=version, components=pending)
+                raise
+        restart_detail = " IW4MAdmin was restarted by the updater when a restart command was configured; otherwise restart it to load the dashboard update." if restart_required else ""
+        self.record_history(
+            "applied",
+            "Update successfully applied",
+            "Updated {} to v{}.{}".format(", ".join(pending), version, restart_detail),
+            version=version,
+            components=pending,
+            restart_required=restart_required,
+        )
         print("Updated {} to v{}. Backup: {}".format(", ".join(pending), version, backup))
 
 
@@ -378,7 +467,11 @@ def main():
             updater.state["lastFailure"] = utc_now()
             updater.state["lastError"] = str(error)
             try:
-                updater.save_state()
+                latest = (updater.state.get("history") or [{}])[0]
+                if latest.get("status") == "failed":
+                    updater.save_state()
+                else:
+                    updater.record_history("failed", "Update check failed", str(error))
             except OSError:
                 pass
         print("Anti-cheat updater error: {}".format(error), file=sys.stderr)

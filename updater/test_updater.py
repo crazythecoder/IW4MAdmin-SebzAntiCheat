@@ -34,6 +34,7 @@ class UpdaterTests(unittest.TestCase):
             config = {
                 "repository": "owner/repository",
                 "stateFile": str(root / "state.json"),
+                "dashboardHistoryFile": str(root / "update-history.json"),
                 "backupDirectory": str(root / "backups"),
                 "autoApply": {"dashboard": True},
                 "targets": {
@@ -65,6 +66,30 @@ class UpdaterTests(unittest.TestCase):
                 archive.writestr("../outside.txt", "bad")
             with self.assertRaises(RuntimeError):
                 UPDATER.safe_extract(archive_path, root / "extract")
+
+    def test_update_history_is_mirrored_for_dashboard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            destination = root / "iw4madmin/Plugins/AnticheatMetrics.js"
+            config = {
+                "repository": "owner/repository",
+                "stateFile": str(root / "state.json"),
+                "backupDirectory": str(root / "backups"),
+                "targets": {"dashboard": [{"source": "dashboard.js", "destination": str(destination)}]},
+            }
+            config_path = root / "updater.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            updater = UPDATER.Updater(config_path)
+            updater.record_history(
+                "staged", "Update staged", "Download verified.",
+                version="1.2.3", components=["dashboard"], restart_required=True,
+            )
+
+            history_path = root / "iw4madmin/Logs/anticheat-update-history.json"
+            history = json.loads(history_path.read_text(encoding="utf-8"))
+            self.assertEqual(history["history"][0]["title"], "Update staged")
+            self.assertTrue(history["history"][0]["restartRequired"])
 
     def test_initialization_seeds_missing_file_without_overwriting_local_config(self):
         with tempfile.TemporaryDirectory() as directory:

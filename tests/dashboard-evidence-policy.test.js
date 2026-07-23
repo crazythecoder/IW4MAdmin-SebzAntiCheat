@@ -19,6 +19,7 @@ function event(overrides) {
         lineOfSight: 'poor/no clear',
         visibleTime: '0ms',
         hitLocation: 'torso_upper',
+        weapon: 'scar_fmj_mp',
         victimName: 'Victim A',
         timestamp: new Date().toISOString(),
         rawReasons: ['Held crosshair on this hidden target before killing them']
@@ -37,6 +38,25 @@ const structuredAim = event({
 });
 assert.strictEqual(plugin.isMeaningfulTimelineEvent(structuredAim), true,
     'strong structured aim telemetry may be retained immediately');
+
+const incompleteSoftTelemetry = event({
+    distance: '?',
+    angle: '?',
+    lineOfSight: 'unknown',
+    visibleTime: '?ms',
+    hitLocation: 'Unknown',
+    riskScore: 100,
+    confidenceScore: 70
+});
+assert.strictEqual(plugin.hasMinimumTelemetryQuality(incompleteSoftTelemetry), false,
+    'high scores must not admit incomplete soft telemetry into the review timeline');
+
+const duplicatePair = [event({ eventId: 'duplicate-a' }), event({
+    eventId: 'duplicate-b',
+    timestamp: new Date(Date.now() + 500).toISOString()
+})];
+assert.strictEqual(plugin.deduplicateEvidenceEvents(duplicatePair).length, 1,
+    'near-identical soft evidence records must be collapsed');
 
 const sameVictim = [0, 1, 2].map(index => event({
     eventId: `same-${index}`,

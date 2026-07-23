@@ -1,6 +1,7 @@
 {
   "repository": "crazythecoder/IW4MAdmin-SebzAntiCheat",
   "stateFile": "/var/lib/iw4x-anticheat-updater/state.json",
+  "dashboardHistoryFile": "/path/to/IW4MAdmin/Logs/anticheat-update-history.json",
   "backupDirectory": "/var/lib/iw4x-anticheat-updater/backups",
   "initialization": {
     "directories": [

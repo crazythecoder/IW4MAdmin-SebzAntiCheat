@@ -302,7 +302,16 @@ acs_watchVisibility()
             }
         }
 
-        wait level.acs_visibility_sample_seconds;
+        sampleSeconds = level.acs_visibility_sample_seconds;
+
+        // Use the existing monitor at a lower frequency as population grows.
+        // This adds no new threads or scans and includes bots in the load count.
+        if (level.players.size >= 14 && sampleSeconds < 0.30)
+            sampleSeconds = 0.30;
+        else if (level.players.size >= 10 && sampleSeconds < 0.25)
+            sampleSeconds = 0.25;
+
+        wait sampleSeconds;
     }
 }
 
@@ -505,7 +514,12 @@ acs_watchAimSnaps()
 
     for (;;)
     {
-        wait level.acs_snap_sample_seconds;
+        sampleSeconds = level.acs_snap_sample_seconds;
+
+        if (level.players.size >= 14 && sampleSeconds < 0.125)
+            sampleSeconds = 0.125;
+
+        wait sampleSeconds;
 
         if (!isAlive(self))
             continue;
@@ -787,7 +801,7 @@ acs_processKill(victim, weapon, meansOfDeath, hitLoc)
         }
     }
 
-    if ((preAimSignal || hiddenCrosshairSignal || hiddenPursuitSignal) && self acs_recentTeamUavActive())
+    if ((preAimSignal || hiddenCrosshairSignal || hiddenPursuitSignal) && self acs_recentTeamUavActive(victim))
     {
         uavContextSignal = 1;
         strongScore = int(strongScore * 0.45);
@@ -1478,6 +1492,23 @@ acs_hasNinja()
     return false;
 }
 
+acs_hasColdBlooded()
+{
+    if (!isPlayer(self))
+        return false;
+
+    if (self _hasPerk("specialty_coldblooded"))
+        return true;
+
+    if (self _hasPerk("specialty_coldblooded_upgrade"))
+        return true;
+
+    if (self _hasPerk("upgraded_specialty_coldblooded"))
+        return true;
+
+    return false;
+}
+
 acs_weaponHasSuppressor(weapon)
 {
     if (!isDefined(weapon))
@@ -1495,12 +1526,17 @@ acs_weaponHasSuppressor(weapon)
     return false;
 }
 
-acs_recentTeamUavActive()
+acs_recentTeamUavActive(victim)
 {
     if (!isDefined(self.pers) || !isDefined(self.pers["team"]))
         return false;
 
     team = self.pers["team"];
+
+    // Cold-Blooded targets are absent from UAV sweeps. Counter-UAV/EMP still
+    // block the attacker's radar because those checks are independent perks.
+    if (isDefined(victim) && victim acs_hasColdBlooded())
+        return false;
 
     // Prefer the stock UAV script's live state. In maps/mp/killstreaks/_uav.gsc,
     // level.activeUAVs is incremented when UAV starts and decremented when the
@@ -1550,7 +1586,7 @@ acs_victimRecentRadarPingVisible(victim)
     if (getTime() - victim.acs_last_unsuppressed_fire_time > 5000)
         return false;
 
-    if (self acs_radarBlockedByTargetTeam(victim))
+    if (self acs_attackerRadarBlocked())
         return false;
 
     return true;
