@@ -9,7 +9,7 @@ const init = (registerNotify, serviceResolver, configWrapper, pluginHelper) => {
 
 const plugin = {
     author: 'Local',
-    version: '1.0.13',
+    version: '1.0.14',
     name: 'Anticheat Metrics',
     logger: null,
     config: null,
@@ -178,7 +178,15 @@ const plugin = {
         this.logger.logInformation('{Name} dashboard render. ParsedEvents={ParsedEvents}, ReviewCases={ReviewCases}, LogPath={LogPath}',
             this.name, items.length, cases.length, this.settings.logPath);
         const purgedCases = this.recoverablePurgedCases();
-        const queueCases = cases.concat(purgedCases);
+        const allQueueCases = cases.concat(purgedCases);
+        const queueLimit = 10;
+        const queueCases = allQueueCases.slice()
+            .sort((left, right) => {
+                const rightTime = Date.parse(right.purgedAt || right.lastSeen || right.time || '') || 0;
+                const leftTime = Date.parse(left.purgedAt || left.lastSeen || left.time || '') || 0;
+                return rightTime - leftTime;
+            })
+            .slice(0, queueLimit);
         const stats = this.dashboardStats(cases, items);
         const systemHealth = this.readSystemHealth();
         const updateHistory = this.readUpdateHistory();
@@ -222,7 +230,7 @@ const plugin = {
                     <div class="ac-toolbar">
                         <div>
                             <h2 class="ac-section-title">Review Queue</h2>
-                            <p class="ac-section-subtitle">${cases.length} active ${cases.length === 1 ? 'case' : 'cases'} grouped by player, server, and GUID.${purgedCases.length ? ` ${purgedCases.length} recoverable ${purgedCases.length === 1 ? 'purge' : 'purges'}.` : ''}</p>
+                            <p class="ac-section-subtitle">Showing the ${Math.min(queueCases.length, queueLimit)} newest of ${allQueueCases.length} ${allQueueCases.length === 1 ? 'case' : 'cases'} grouped by player, server, and GUID.${purgedCases.length ? ` ${purgedCases.length} recoverable ${purgedCases.length === 1 ? 'purge' : 'purges'}.` : ''}</p>
                         </div>
                         <div class="ac-controls">
                             <label class="ac-control">
